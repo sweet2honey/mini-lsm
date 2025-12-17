@@ -1,3 +1,7 @@
+My solution is under branch `solution`.
+
+---
+
 ![Mini-LSM: Learn database internals by building an LSM storage engine in Rust](./mini-lsm-book/src/mini-lsm-banner.svg)
 
 # Mini-LSM: Build a Database Storage Engine in Rust

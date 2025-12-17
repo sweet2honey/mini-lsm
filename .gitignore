@@ -5,3 +5,5 @@ sync-tmp/
 mini-lsm.db/
 lsm.db/
 .DS_Store
+
+mini-lsm-starter/src/tests/
