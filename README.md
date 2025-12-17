@@ -1,3 +1,7 @@
+My solution is under branch `solution`.
+
+---
+
 ![banner](./mini-lsm-book/src/mini-lsm-logo.png)
 
 # LSM in a Week
