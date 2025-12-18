@@ -1,4 +1,5 @@
 My solution is under branch `solution`.
+Some thoughts are under `mini-lsm-starter/understandings`.
 
 ---
 
