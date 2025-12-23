@@ -20,7 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
@@ -130,8 +130,23 @@ impl MemTable {
     }
 
     /// Get an iterator over a range of keys.
-    pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
-        unimplemented!()
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator {
+        // Create a range that the skipmap can scan from
+        let range = (map_bound(lower), map_bound(upper));
+
+        // Build the MemTableIterator(provided by ouroboros)
+        let mut iter = MemTableIteratorBuilder {
+            map: self.map.clone(),
+            iter_builder: |map| map.range(range),
+            item: (Bytes::new(), Bytes::new()),
+        }
+        .build();
+
+        // Access next item
+        let next_item = iter.with_iter_mut(|iter| MemTableIterator::map_entry_to_item(iter.next()));
+        iter.with_mut(|iter| *iter.item = next_item);
+
+        iter
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
@@ -173,22 +188,42 @@ pub struct MemTableIterator {
     item: (Bytes, Bytes),
 }
 
+impl MemTableIterator {
+    // NOT necessary
+    // A helper function to get an item from a optinal skipmap entry,
+    // used in `impl StorageIterator for MemTableIterator::next` and
+    // `impl MemTable::scan`
+    fn map_entry_to_item(
+        entry: Option<crossbeam_skiplist::map::Entry<'_, Bytes, Bytes>>,
+    ) -> (Bytes, Bytes) {
+        entry
+            .map(|x| (x.key().clone(), x.value().clone()))
+            .unwrap_or_else(|| (Bytes::from_static(&[]), Bytes::from_static(&[])))
+    }
+}
+
 impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.borrow_item().1.as_ref()
     }
 
-    fn key(&self) -> KeySlice {
-        unimplemented!()
+    fn key(&self) -> KeySlice<'_> {
+        KeySlice::from_slice(self.borrow_item().0.as_ref())
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.borrow_item().0.is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let next_item = self.with_iter_mut(|it| {
+            //* Forward the skipmap iter, try fetching the next k-v pair out
+            Self::map_entry_to_item(it.next())
+        });
+
+        self.with_item_mut(|item| *item = next_item);
+        Ok(())
     }
 }
