@@ -18,8 +18,34 @@ use bytes::Bytes;
 use tempfile::{TempDir, tempdir};
 
 use crate::iterators::StorageIterator;
-use crate::key::{KeySlice, KeyVec};
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::key::{KeyBytes, KeySlice, KeyVec};
+use crate::table::{BlockMeta, SsTable, SsTableBuilder, SsTableIterator};
+
+#[test]
+fn test_block_meta_encode_decode() {
+    let block_metas = vec![
+        BlockMeta {
+            offset: 1, // Place holder for tests ONLY
+            first_key: KeyBytes::for_testing_from_bytes_no_ts(Bytes::from_static(b"1")),
+            last_key: KeyBytes::for_testing_from_bytes_no_ts(Bytes::from_static(b"1")),
+        },
+        BlockMeta {
+            offset: 2,
+            first_key: KeyBytes::for_testing_from_bytes_no_ts(Bytes::from_static(b"2")),
+            last_key: KeyBytes::for_testing_from_bytes_no_ts(Bytes::from_static(b"2")),
+        },
+        BlockMeta {
+            offset: 3,
+            first_key: KeyBytes::for_testing_from_bytes_no_ts(Bytes::from_static(b"3")),
+            last_key: KeyBytes::for_testing_from_bytes_no_ts(Bytes::from_static(b"3")),
+        },
+    ];
+
+    let mut buf = Vec::new();
+    BlockMeta::encode_block_meta(&block_metas, &mut buf);
+    let decoded_metas = BlockMeta::decode_block_meta(&buf);
+    assert_eq!(decoded_metas.unwrap(), block_metas);
+}
 
 #[test]
 fn test_sst_build_single_key() {

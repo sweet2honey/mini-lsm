@@ -75,6 +75,7 @@ impl BlockMeta {
     }
 
     /// Decode block meta from a buffer.
+    /// Before checksum optimization is implemented in week 2, returning `Result::Ok`.
     pub fn decode_block_meta(mut buf: &[u8]) -> Result<Vec<BlockMeta>> {
         let mut block_meta = Vec::new();
         let num = buf.get_u32() as usize;
