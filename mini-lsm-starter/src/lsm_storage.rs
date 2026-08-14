@@ -298,12 +298,19 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let memtable = self.state.read().memtable.clone();
-        match memtable.get(key) {
-            Some(value) if value.is_empty() => Ok(None),
-            Some(value) => Ok(Some(value)),
-            None => Ok(None),
+        let snapshot = self.state.read().clone();
+
+        // Probe the mutable memtable first, then immutable memtables newest-to-oldest.
+        // The first memtable that holds the key decides: an empty value is a tombstone
+        // (key is deleted), a non-empty value is the answer, and no hit means absent.
+        for memtable in std::iter::once(&snapshot.memtable).chain(snapshot.imm_memtables.iter()) {
+            match memtable.get(key) {
+                Some(value) if value.is_empty() => return Ok(None),
+                Some(value) => return Ok(Some(value)),
+                None => continue,
+            }
         }
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
