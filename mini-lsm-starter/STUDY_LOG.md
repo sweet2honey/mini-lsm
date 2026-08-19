@@ -7,8 +7,8 @@
 
 ## Progress
 
-- [x] Week 1, Day 1 — Memtable (ordered in-memory state) — `cargo x scheck` clean, 6/6 tests
-- [ ] Week 1, Day 2 — Merge iterator + memtable iterator (`StorageIterator`, `MemTableIterator`)
+- [x] Week 1, Day 1 — Memtable (ordered in-memory state) — 6/6 tests
+- [x] Week 1, Day 2 — Iterators (memtable iterator, merge iterator, LSM iterator, fused iterator, engine scan) — 14/14 tests cumulative
 - [ ] Week 1, Day 3 — Block
 - [ ] Week 1, Day 4 — SST
 - [ ] Week 1, Day 5 — Read path
@@ -17,7 +17,75 @@
 - [ ] Week 2 — Compaction, manifest, WAL
 - [ ] Week 3 — MVCC, txn, snapshot read
 
-**Current position:** Day 1 complete. Next open question is Day 2's range-scan bound handling.
+**Current position:** Day 2 complete. Next open question is Day 3's block encoding format (entry layout, prefix compression / restarts).
+
+---
+
+## Week 1, Day 2 — Iterators
+
+### Decisions carried in (from Day 1, unchanged)
+- Tombstone = empty value; memtable returns it verbatim, engine interprets.
+- imm_memtables newest-to-oldest; mutable probed first.
+- state_lock + recheck for freeze races; size accounting is an upper bound (soft limit).
+
+### Slice 1 — MemTableIterator
+
+Decision | Student's choice | Invariant/evidence | Consequence
+---------|------------------|--------------------|------------
+Iterator exhaustion signal | empty-key sentinel in `item` | next() writes (Bytes::new(), Bytes::new()) when Range runs out; book: ok next() need not mean valid | one piece of state; a real empty key would be misreported as exhausted — accepted simplification
+Upper-bound handling in scan | delegated (choose for me): pass bounds straight through via map_bound | SkipMap::range natively respects Included/Excluded | no manual bound adjustment; exclusion enforced by SkipMap, not our code
+
+Files: `src/mem_table.rs` — `scan` via ouroboros builder (clone Arc<SkipMap>, build range iterator borrowing it, position at first entry); `key`/`value`/`is_valid`/`next` implemented.
+
+### Slice 2 — MergeIterator
+
+Decision | Student's choice | Invariant/evidence | Consequence
+---------|------------------|--------------------|------------
+Duplicate resolution | newest (lowest-index) child wins; next() must advance EVERY heap child at the emitted key | book's merged example; starter Ord: key cmp, then index, reversed (max-heap pops smallest) | otherwise stale duplicate resurfaces after the surfaced child advances
+Error path in next() | delegated: pop errored child from heap BEFORE returning Err | PeekMut::drop re-sorts heap, would read key() on poisoned child | comparator never touches a poisoned iterator
+
+Files: `src/iterators/merge_iterator.rs` — `create` pushes only valid children; `next` snapshots emitted key, drains all heap children at that key (pop exhausted/errored), advances and reseats `current`.
+
+### Slice 3 — LsmIterator + FusedIterator
+
+Decision | Student's choice | Invariant/evidence | Consequence
+---------|------------------|--------------------|------------
+Where tombstones are filtered | AFTER duplicate resolution, in LsmIterator above the merge | filtering at MemTableIterator level would lose precedence info and resurrect older values (e.g. b->2 after b->delete) | tombstones visible through merge; hidden only at engine wrapper
+FusedIterator semantics | course contract (starter doc comment) | invalid -> next no-op; error -> is_valid false forever, next always errs | mechanical
+
+Files: `src/lsm_iterator.rs` — `LsmIterator::new` eager-skips tombstones (after merge may start on one); `next` advances then skips; `key` returns `raw_ref()` (KeyType = &[u8], not KeySlice). `FusedIterator` latches `has_errored`.
+
+### Slice 4 — engine `scan`
+
+Decision | Student's choice | Invariant/evidence | Consequence
+---------|------------------|--------------------|------------
+Merge constructor order | mutable first (index 0), then imm_memtables front-to-back | same precedence as get probe order from Day 1 | newest-wins on ties via index tie-break in MergeIterator's Ord
+
+Files: `src/lsm_storage.rs` — `scan` snapshots state, builds one MemTableIterator per memtable, wraps MergeIterator -> LsmIterator -> FusedIterator. Added imports for MergeIterator and MemTableIterator.
+
+### Invariants
+- Only valid children in heap (comparator reads key()).
+- `current` is always the minimum (key, index) across children.
+- After every `next()`, exhausted/errored children removed before PeekMut guard drop.
+- `next()` returning Ok does NOT imply still valid (empty memtable starts invalid).
+- Scan reflects the snapshot at creation time; concurrent writes to the same memtable are visible only to new scans (open question for the book's bonus experiment).
+
+### Boundary cases the supplied tests may not establish
+1. **Three iterators, same key in all three** — next() must drain it from two heap children plus `current`. Suite likely only tests two-iterator merges.
+2. **Empty keys via `put(b"", b"1")`** — MemTableIterator's empty-key sentinel would treat it as exhaustion; a misbehavior we accept as a simplification (defensible only if empty keys are disallowed).
+3. **Scan-time concurrent put** — MemTableIterator holds `Arc<SkipMap>`; does it see keys inserted after `scan()` was created? (book's suggested experiment — stability is unclear from the type signature alone.)
+4. **get() vs scan() on same data** — get and scan must agree with respect to tombstones and freeze boundaries.
+
+### Commands run (Day 2)
+- `cargo x copy-test --week 1 --day 2` — copied harness + week1_day2.
+- `cargo x copy-test --week 1 --day 1` — re-copied after tests.rs was overwritten (copy-test regenerates tests.rs from whatever test files exist in the target dir; day-2 copy had dropped day-1's module registration).
+- `cargo x scheck` (repo root) — fmt clean, check clean, **14/14 tests pass** (8 day1 + 6 day2), clippy clean.
+
+### Review lines (Day 2)
+1. `!self.borrow_item().0.is_empty()` (MemTableIterator::is_valid) — Q: why is an empty key a valid exhaustion signal; what breaks on a real empty key? A: sentinel is single-source-of-truth; real empty key would be misread as exhausted (accepted limitation). Verdict: answered correctly.
+2. `self.1.key().cmp(&other.1.key()).then(self.0.cmp(&other.0)).reverse()` (HeapWrapper Ord, starter-provided but relied on) — Q: why does `.reverse()` make small keys pop first; why ascending-index tie-break and who orders the vector? A: max-heap + reversed cmp surfaces smallest key; lower index = newer child placed by `scan`/merge constructor. Verdict: correct after terminology fix (memtables, not SSTs, at this stage).
+3. `self.inner.next()?; self.skip_tombstones()` (LsmIterator::next) — Q: why advance twice; what breaks if `is_valid` just returned false on tombstones? A: first advance moves past the current entry, skip drains the tombstone chain; without it, a tombstone would *terminate* the caller's loop and truncate everything after it (e.g. `c->4` after `b->delete`). Key insight (student): tombstone is a normal entry at the cursor level; "deleted" exists only at the LsmIterator layer. Verdict: correct.
+4. No separate review line for Slice 4 (engine `scan` — implemented under a continue window); the adversarial three-iterator duplicate-drain (`b->delete` over `b->2`, `b->1` + `a->4`, `c->3` -> output `a->4, c->3`) served as its check. Verdict: student traced it correctly.
 
 ---
 
@@ -41,7 +109,7 @@ Read path probe order | mutable first, then imm_memtables front-to-back (newest 
 
 ### Key invariants the code relies on
 - SkipMap keys unique and ordered => insert overwrites => at most one value per key per memtable.
-- `Bytes::clone` is a refcount increment, not a deep copy — `get` borrows the entry and produces a new refcount handle to the same bytes.
+- `Bytes::clone` is a refcount increment, not a deep copy.
 - `state.read()` derefs to `&LsmStorageState`; `.clone()` on the snapshot clones the `Arc` cheaply and releases the lock before mutation.
 - `state_lock` serializes structural changes; recheck after acquiring reflects post-freeze reality.
 - `imm_memtables` ordered newest-to-oldest; `insert(0, ...)` preserves it; mutable probed first.
@@ -57,5 +125,9 @@ Read path probe order | mutable first, then imm_memtables front-to-back (newest 
 - `cargo x copy-test --week 1 --day 1` — copied harness + week1_day1 modules.
 - `cargo x scheck` (repo root) — fmt clean, check clean, 6/6 tests pass, clippy clean.
 
-### Next unresolved design question
-Day 2: memtable iterator (`MemTableIterator`, the `#[self_referencing]` struct) + `StorageIterator` trait. First decision: how `scan(lower, upper)` handles `Bound::Included` vs `Bound::Excluded`, and whether the iterator stops or signals end at the upper bound.
+
+### Review lines (Day 1)
+1. `self.map.get(key).map(|entry| entry.value().clone())` (MemTable::get) — Q: what does entry.value().clone() produce; what breaks if value() without clone, or if None on empty value? A: new refcount handle to same bytes (not a move-out; map entry stays); returning None for tombstones would erase the deleted-vs-never-held distinction. Verdict: correct after refinement (clone ≈ Arc bump, entry untouched).
+2. `let memtable = self.state.read().memtable.clone();` (engine get/put) — Q: what is cloned, why release the lock at the statement end; what breaks with `&self.state.read().memtable` (no clone), and with holding the read lock across `memtable.put`? A: Arc refcount bump, not map copy; bare reference = dangling after the guard (temporary) drops, borrow checker rejects; holding the lock across put serializes writers and blocks freeze's write lock. Verdict: part 1 correct; part 2 needed explanation (temporary-guard lifetime + freeze write-lock conflict).
+3. `std::mem::replace(&mut snapshot.memtable, new_memtable); snapshot.imm_memtables.insert(0, old_memtable);` (freeze) — Q: why replace vs plain assignment; what does insert(0) guarantee? A: replace yields the old Arc instead of dropping it (plain assignment would lose the handle); insert at 0 preserves newest-to-oldest so `imm.first()` is the most recently frozen. Verdict: correct after fix — initially read insert(0) as "queried later"; it's queried FIRST.
+4. `std::iter::once(&snapshot.memtable).chain(snapshot.imm_memtables.iter())` (engine get probe order) — Q: what does the chain produce; what breaks if order is swapped (imm first, mutable last)? A: mutable (newest) then imm newest-to-oldest; swap makes an older imm hit first and shadow the newer mutable entry (stale a->1 over a->3; tombstone-overwrite case resurrects a deleted key). Verdict: correct after concrete walkthrough.
