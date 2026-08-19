@@ -17,6 +17,7 @@
 
 use std::cmp::{self};
 use std::collections::BinaryHeap;
+use std::collections::binary_heap::PeekMut;
 
 use anyhow::Result;
 
@@ -59,7 +60,19 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut heap = BinaryHeap::new();
+        for (index, iter) in iters.into_iter().enumerate() {
+            // Exhausted iterators never enter the merge: the comparator reads `key()`,
+            // which is only meaningful on a valid child.
+            if iter.is_valid() {
+                heap.push(HeapWrapper(index, iter));
+            }
+        }
+        let current = heap.pop();
+        Self {
+            iters: heap,
+            current,
+        }
     }
 }
 
@@ -69,18 +82,57 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.current.as_ref().unwrap().1.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().unwrap().1.value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current
+            .as_ref()
+            .is_some_and(|current| current.1.is_valid())
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // Snapshot the emitted key first: it borrows from `current`, which we are
+        // about to advance.
+        let emitted_key = self
+            .current
+            .as_ref()
+            .map(|current| current.1.key().to_key_vec())
+            .unwrap();
+
+        while let Some(mut inner) = self.iters.peek_mut() {
+            if inner.1.key() != emitted_key.as_key_slice() {
+                break;
+            }
+            // Advance every child still positioned at the emitted key; `current`
+            // will be handled below.
+            match inner.1.next() {
+                Ok(()) => {
+                    if !inner.1.is_valid() {
+                        PeekMut::pop(inner);
+                    }
+                }
+                Err(e) => {
+                    // The errored child must not remain in the heap: the guard's
+                    // drop re-sorts and would read `key()` on a poisoned iterator.
+                    PeekMut::pop(inner);
+                    return Err(e);
+                }
+            }
+        }
+
+        // Advance the surfaced child and reseat it into the heap if it still has data.
+        let mut current = self.current.take().unwrap();
+        current.1.next()?;
+        if current.1.is_valid() {
+            self.iters.push(current);
+        }
+
+        self.current = self.iters.pop();
+        Ok(())
     }
 }
