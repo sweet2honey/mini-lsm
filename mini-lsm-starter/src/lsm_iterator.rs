@@ -31,7 +31,21 @@ pub struct LsmIterator {
 
 impl LsmIterator {
     pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
-        Ok(Self { inner: iter })
+        let mut iter = Self { inner: iter };
+        // The merge may surface a tombstone at its very first position, so
+        // skip must happen at birth as well as on every advance.
+        iter.skip_tombstones()?;
+        Ok(iter)
+    }
+
+    /// Advance past deletion tombstones (empty values). Tombstones participate in
+    /// duplicate resolution inside `LsmIteratorInner` and are only hidden here,
+    /// above the merge.
+    fn skip_tombstones(&mut self) -> Result<()> {
+        while self.inner.is_valid() && self.inner.value().is_empty() {
+            self.inner.next()?;
+        }
+        Ok(())
     }
 }
 
@@ -39,19 +53,20 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.inner.is_valid()
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.key().raw_ref()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.inner.next()?;
+        self.skip_tombstones()
     }
 }
 
@@ -79,18 +94,30 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         Self: 'a;
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.has_errored && self.iter.is_valid()
     }
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.iter.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if self.has_errored {
+            return Err(anyhow::anyhow!(
+                "iterator previously returned an error and is no longer usable"
+            ));
+        }
+        if !self.iter.is_valid() {
+            return Ok(());
+        }
+        if let Err(e) = self.iter.next() {
+            self.has_errored = true;
+            return Err(e);
+        }
+        Ok(())
     }
 }
