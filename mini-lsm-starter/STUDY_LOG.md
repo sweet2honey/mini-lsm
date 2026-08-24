@@ -9,7 +9,7 @@
 
 - [x] Week 1, Day 1 — Memtable (ordered in-memory state) — 6/6 tests
 - [x] Week 1, Day 2 — Iterators (memtable iterator, merge iterator, LSM iterator, fused iterator, engine scan) — 14/14 tests cumulative
-- [ ] Week 1, Day 3 — Block
+- [x] Week 1, Day 3 — Block (builder + encode/decode + iterator, binary-search seek) — 23/23 tests cumulative
 - [ ] Week 1, Day 4 — SST
 - [ ] Week 1, Day 5 — Read path
 - [ ] Week 1, Day 6 — Write path
@@ -17,9 +17,53 @@
 - [ ] Week 2 — Compaction, manifest, WAL
 - [ ] Week 3 — MVCC, txn, snapshot read
 
-**Current position:** Day 2 complete. Next open question is Day 3's block encoding format (entry layout, prefix compression / restarts).
+**Current position:** Day 3 complete. Next open question is Day 4's SST format (block index / meta section, block cache, SST iterator bridging across BlockIterators).
 
 ---
+
+## Week 1, Day 3 — Block
+
+### Decision ledger
+
+Decision | Student's choice | Invariant/evidence | Consequence
+---------|------------------|--------------------|------------
+Size gate in `add` | `projected = S + 6 + key_len + value_len` (S = current full encoded size); reject (`false`, no mutation) when `projected > block_size`; first entry always accepted | book invariant 4 + forward-progress carve-out | block never exceeds target unless one entry alone exceeds it; builder never stalls on an oversized first key
+Endianness of u16 fields | little-endian (`put_u16_le`/`get_u16_le`, manual `from_le_bytes` in iterator) | native byte order on x86 (no swap on hot path); encoder/decoder must agree; byte-comparison tests confirm immediately | all lengths, offsets, and count are LE
+`seek_to_key` landing (course rule, derived) | first key >= target, else invalid; below-first -> first entry | book invariant 5 + example (seek 2 lands on 3) | lower-bound semantics at all edges
+End-of-block behavior | `next()` off the end -> key empty -> invalid; no panic; crossing to the next block is the future SSTIterator's job | book: "caller can then move to another block"; BlockIterator holds one `Arc<Block>`, no next-block reference | single-block scans terminate cleanly; layer discipline matches day-2 tombstone-above-merge
+`seek_to_key` algorithm | binary search over entry indices, probing `offsets[mid]` and decoding only key_len+key (never value) | book: offsets "turn variable-length entries into an index" | O(log n) probes x O(K) key compare each
+Cursor representation | copy current key into `KeyVec`; keep value as `(start,end)` range into data section | book Task 2: copy key now so the struct survives future key compression; value stays zero-copy | value() is a raw slice; struct unchanged when compression lands
+
+### Files changed
+- `src/block/builder.rs` — `new`, `add` (record offset, append `key_len|key|value_len|value` LE, first-entry carve-out), `is_empty`, `build`, plus `estimated_size()` helper.
+- `src/block.rs` — `encode` (`data | offsets | num_of_elements`), `decode` (count from tail, offsets section before it, data section before that; trusts input).
+- `src/block/iterator.rs` — shared private `seek_to(idx)` decoder; binary-search `seek_to_key`; `next` = idx+1 then seek_to; validity = non-empty key.
+
+### Key invariants the code relies on
+- encode/decode are exact inverses for every valid block; the byte-comparison tests pin field order and endianness.
+- One ordered offset per entry, each a valid position in the data section; footer = offsets + u16 count.
+- `is_valid` (non-empty key) is the sole termination gate; exhaustion clears the key.
+- The decoder TRUSTS its input: it indexes with no validation of count or offset sanity (book checkpoint flags this).
+- Keys non-empty (debug_assert); empty value (tombstone) is preserved verbatim by builder and iterator.
+
+### Boundary cases the supplied tests may not establish
+1. **Tombstone through the block layer** — `add("a", [])`: value_len=0; iterator must return `value() == b""` and stay valid. Supplied tests use only non-empty values.
+2. **Decoder on malformed bytes** — wrong count / out-of-range offset / truncated length slice: our decoder panics on out-of-bounds indexing (book checkpoint asks what a production decoder would validate).
+3. **Duplicate keys inside one block** — the builder never dedupes; binary-search lower bound lands on the FIRST duplicate. (Book asks: can a block contain duplicated keys? Format allows; upper layers assume not.)
+4. **u16 length overflow** — key or value > 65535 would truncate silently; only debug_assert guards it.
+
+### Commands run (Day 3)
+- `cargo check --lib` — clean on the first pass.
+- `cargo x copy-test --week 1 --day 3` — copied harness + week1_day3, and left `src/tests/` with ONLY those two files (day1/day2 files dropped, same copy-test behavior noted on Day 2).
+- `cargo test week1_day3` — 9/9 pass (encode, decode, build_single_key, build_full, build_large_1/2, build_all, iterator, seek_key).
+- `cargo x copy-test --week 1 --day 1` and `--day 2` — restored day1/day2; copy-test is additive per day and regenerates tests.rs from all files present.
+- `cargo x scheck` (repo root) — fmt clean, check clean, **23/23 tests pass: 6 day1 + 8 day2 + 9 day3** (Day 2's log entry has the 6/8 split transposed; total was always 14), clippy clean.
+
+### Review lines (Day 3)
+1. `if !self.is_empty() && self.estimated_size() + entry_size > self.block_size { return false; }` — Q(a): what does `!self.is_empty()` protect, what breaks if deleted? A: "big entry causes storage to stall" — refined: removing it makes `add` return false on an EMPTY builder -> SST builder emits nothing, opens another empty block, retries forever; the carve-out = guaranteed forward progress. Q(b): is the count field a size or value claim; why is 6 the right per-entry cost? A: "size claim; cost = key_len + value_len + entry_offset" — exactly: `num_of_elements` is always 2B regardless of value, so per-entry cost = 2+2+2 = 6. Verdict: both correct.
+2. `len` checks in `decode`/`seek_to` — Q: name two distinct corrupt-block failure modes and what a production decoder validates first. First attempt (wrong): "indices only" — caught count-lie underflow but mistook safe-Rust slicing for C-style OOB reads. Correction given: safe Rust panics on slice bounds, never slow/large reads; and a wrong-but-in-bounds count causes SILENT mis-slicing (valid-looking, wrong block — data tail eaten into offsets). Q follow-up (hint offered): ordered validation sequence. Student's answer: "add a crc field in the final block covering data+offset+num" — the RocksDB mechanism (1B compression-type + 4B CRC32C trailer). Supplied the remaining sequence: CRC hash first; buffer >= footer; `count*2` fits; offsets monotonic-and-bounded; lengths bounded per entry before slicing. Key teaching point the student owns: CRC catches *random* corruption, structure checks catch *malice* (checksum is forgeable — integrity, not security). Verdict: correct after one correction + one hint.
+3. Tombstone round-trip (`add("a", [])`) — Q: what does encode emit, what does value() return, is it valid, why load-bearing? A: key_len=1, "a", value_len=0, empty value; value() == b""; iterator stays valid because validity tracks cursor not value. Correct. Consequence (supplied): if empty-value implied invalid, scans would truncate at tombstones — same bug class as day-2 LsmIterator, at the storage layer. Verdict: correct.
+
 
 ## Week 1, Day 2 — Iterators
 
