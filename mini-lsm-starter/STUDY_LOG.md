@@ -10,16 +10,58 @@
 - [x] Week 1, Day 1 — Memtable (ordered in-memory state) — 6/6 tests
 - [x] Week 1, Day 2 — Iterators (memtable iterator, merge iterator, LSM iterator, fused iterator, engine scan) — 14/14 tests cumulative
 - [x] Week 1, Day 3 — Block (builder + encode/decode + iterator, binary-search seek) — 23/23 tests cumulative
-- [ ] Week 1, Day 4 — SST
+- [x] Week 1, Day 4 — SST (builder, meta encode, iterator, block cache) — 30/30 tests cumulative
 - [ ] Week 1, Day 5 — Read path
 - [ ] Week 1, Day 6 — Write path
 - [ ] Week 1, Day 7 — SST optimizations (bloom filter)
 - [ ] Week 2 — Compaction, manifest, WAL
 - [ ] Week 3 — MVCC, txn, snapshot read
 
-**Current position:** Day 3 complete. Next open question is Day 4's SST format (block index / meta section, block cache, SST iterator bridging across BlockIterators).
+**Current position:** Day 4 complete. Next open question is Day 5's read path (multi-source merge across memtables + SSTs, layered iterator tree).
 
 ---
+
+## Week 1, Day 4 — SST
+
+### Decision ledger
+
+Decision | Student's choice | Invariant/evidence | Consequence
+---------|------------------|--------------------|------------
+Block cut in SsTableBuilder::add | inner `BlockBuilder::add` false -> `std::mem::replace` builder with fresh builder, build+encode old, push meta {offset = data.len() BEFORE append, first_key, last_key}, append block bytes, re-offer key to fresh builder | book: "split a new block when the current block is full"; fresh BlockBuilder ALWAYS accepts its first entry (Day 3 carve-out) so add never fails | only the last block may be smaller than block_size
+Meta layout on disk | delegated: count-prefixed `u32 num_blocks LE`, then N records of `u32 offset, u16 first_len, first_key, u16 last_len, last_key` | book: meta section must be self-describing; reserve exact size up-front (buf.reserve(estimated)) | decode is seek-capable without trailing sentinel; consistent LE with Block from Day 3
+find_block_idx strategy | first-key-only binary search: `partition_point(\|meta\| meta.first_key <= key).saturating_sub(1)`; iterator advances one block if in-block lower-bound lands invalid | book recommendation; student walked `seek(d)` with blocks [a,b,c],[e,f,g] -> picks block 1 -> invalid -> advance to block 2 on `e` | one extra block read possible per gap key
+Field width constants | OFFSET_ENCODED_LEN (u32), LENGTH_ENCODED_LEN (u16), BLOCK_META_ENTRY_OVERHEAD = OFFSET + 2*LENGTH | user: derive from encoded widths, not host word size | all paths (encode/decode/open) express widths symbolically; offsets are u32 NOT usize
+Endianness of meta & footer | all LE, consistent with Block | **bug caught by test_sst_decode**: build wrote footer with put_u32_le, open read with get_u32 (BE default) -> meta_offset read as huge value -> subtraction overflow at `len - 4 - meta_offset` | student diagnosis was immediate; never mix byte orders across encode/decode
+
+### Files changed
+- `src/table/builder.rs` — `new`, `add` (sorted assert, finish_block on full), `estimated_size` (data bytes only), `build` (footer = u32 LE meta_offset, FileObject::create).
+- `src/table.rs` — OFFSET/LENGTH width constants, `BlockMeta::encode/decode` (count-prefixed, reserve exact), `SsTable::open`, `read_block` (offset->offset+1 or meta_offset, decode), `read_block_cached` (moka `try_get_with` on (sst_id, block_idx), Arc<Error> for shared misses), `find_block_idx` (partition_point).
+- `src/table/iterator.rs` — SsTableIterator with `advance_if_needed` (single-hop to next block on invalid); all seeks/next funnel through it.
+
+### Key invariants the code relies on
+- BlockMeta records appear in same key order as data blocks; meta.offset = where block bytes begin.
+- Block i spans [meta[i].offset, meta[i+1].offset); last block up to meta_offset. No explicit block lengths.
+- Lower-bound seeks never skip a key >= target: if block i's iterator lands invalid, ALL keys in block i < key, AND meta[i+1].first_key > key (because find_block_idx found the LAST block with first_key <= key) -> single advance suffices. No loop needed because blocks are non-empty and strictly ordered.
+- Block cache key MUST be (sst_id, block_idx); block_idx alone collides ACROSS SSTs.
+
+### Boundary cases the supplied tests may not establish
+1. **read_block_cached cache-hit/miss-coalescing path is COMPLETELY UNTESTED** — `build_for_test` passes `block_cache: None` in every test, so `try_get_with` (concurrent miss coalescing) never runs. The `Some(cache)` branch is dead code to the suite.
+2. **Repeated seek_to_key to an EARLIER position on the same iterator** — suite only seeks forward per offset pass. Works because seek_to_key rebuilds the block iterator from scratch.
+3. **Eviction under live Arc handles** — an iterator holds Arc<Block> outside the cache; eviction removes the map key, not the memory. Cache capacity bounds cache-held blocks only.
+4. **Blocks larger than block_size** — generator's block_size=128 entries ~23 bytes uniform; first-entry carve-out (one oversized entry) never hit in SST context.
+5. **Blocks with 0 keys** — advance_if_needed does one hop; would skip a needed second hop if an empty block could exist. Relies on blocks-always-non-empty.
+
+### Commands run (Day 4)
+- `cargo check --lib` — clean first pass after one BufMut import fix and one garbled-edit repair.
+- `cargo x copy-test --week 1 --day 4` — added week1_day4; prior days retained (copy-test is additive when files already exist).
+- `cargo test week1_day4` — FIRST RUN FAILED: `test_sst_decode` panicked "attempt to subtract with overflow" at table.rs:155 (`len - 4 - meta_offset as u64` where meta_offset was huge). **Student diagnosis**: endianness mismatch — builder wrote footer with put_u32_le, open read with get_u32 (big-endian default in `bytes`). Fix: `get_u32_le`.
+- Second run — 7/7 pass.
+- `cargo x scheck` (repo root) — fmt clean, check clean, clippy clean, **30/30 tests** (6 day1 + 8 day2 + 9 day3 + 7 day4).
+
+### Review lines (Day 4)
+1. `partition_point(\|meta\| meta.first_key <= key).saturating_sub(1)` — Q: what does partition_point return, what does -1 produce, what happens on `seek("")`? A: "points to the first element NOT satisfying the predicate; sub 1 gives last block with first_key <= search key" — correct. (seek("") case walked: partition_point=0, saturating_sub=0 -> block 0 = correct lower-bound landing spot.) Verdict: correct.
+2. `advance_if_needed` — Q: prove a single hop always suffices; name both invariants. A(student): "partition_point ensures + BlockBuilder never emits an empty block, so hopping always lands on a valid key." Correct — (a) blocks non-empty => seek_to_first always valid; (b) find_block_idx picks the LAST block with first_key <= key => every key in block i+1 is > target, so its first entry is exactly the lower bound. Verdict: correct after one nudge (initial answer named only the search half).
+3. Block-read path (book checkpoint) — Q: when does disk IO happen; what does the iterator retain vs the cache? First answer "IO happens when reading block 4, cache retains 1~4" — partial (conflated iterator and cache lifetimes, missed miss-vs-hit split). Corrected after framing: "`!self.blk_iter.is_valid()` triggers the new read (maybe from cache)" — `try_get_with` decides disk vs cheap Arc clone on the miss. Corrected full picture the student was walked to: iterator retains exactly ONE Arc<Block> (current position); cache retains every block read so far up to capacity, independent of iterator; eviction never invalidates a held Arc and iterator-drop never prunes the cache. Verdict: correct after one correction.
 
 ## Week 1, Day 3 — Block
 
@@ -63,6 +105,7 @@ Cursor representation | copy current key into `KeyVec`; keep value as `(start,en
 1. `if !self.is_empty() && self.estimated_size() + entry_size > self.block_size { return false; }` — Q(a): what does `!self.is_empty()` protect, what breaks if deleted? A: "big entry causes storage to stall" — refined: removing it makes `add` return false on an EMPTY builder -> SST builder emits nothing, opens another empty block, retries forever; the carve-out = guaranteed forward progress. Q(b): is the count field a size or value claim; why is 6 the right per-entry cost? A: "size claim; cost = key_len + value_len + entry_offset" — exactly: `num_of_elements` is always 2B regardless of value, so per-entry cost = 2+2+2 = 6. Verdict: both correct.
 2. `len` checks in `decode`/`seek_to` — Q: name two distinct corrupt-block failure modes and what a production decoder validates first. First attempt (wrong): "indices only" — caught count-lie underflow but mistook safe-Rust slicing for C-style OOB reads. Correction given: safe Rust panics on slice bounds, never slow/large reads; and a wrong-but-in-bounds count causes SILENT mis-slicing (valid-looking, wrong block — data tail eaten into offsets). Q follow-up (hint offered): ordered validation sequence. Student's answer: "add a crc field in the final block covering data+offset+num" — the RocksDB mechanism (1B compression-type + 4B CRC32C trailer). Supplied the remaining sequence: CRC hash first; buffer >= footer; `count*2` fits; offsets monotonic-and-bounded; lengths bounded per entry before slicing. Key teaching point the student owns: CRC catches *random* corruption, structure checks catch *malice* (checksum is forgeable — integrity, not security). Verdict: correct after one correction + one hint.
 3. Tombstone round-trip (`add("a", [])`) — Q: what does encode emit, what does value() return, is it valid, why load-bearing? A: key_len=1, "a", value_len=0, empty value; value() == b""; iterator stays valid because validity tracks cursor not value. Correct. Consequence (supplied): if empty-value implied invalid, scans would truncate at tombstones — same bug class as day-2 LsmIterator, at the storage layer. Verdict: correct.
+4. Final understanding — duplicate keys (`add("k","v1")` then `add("k","v2")`) — Q: what does the block hold, what does seek return, where does "no duplicates" live, consequence if violated? First attempt (WRONG): student conflated the block with the SkipMap ("newer overwrites", "enforced in code through skip map") — the block is a byte array; `BlockBuilder::add` has no lookup at all, both entries land in `data` with two offsets. Corrected: block holds BOTH k->v1 (idx 0) and k->v2 (idx 1); binary search keeps shrinking `high` on `>= target` so it lands on the FIRST matching entry -> seek returns v1 (the OLDER value) -> silent staleness for any caller that violates the convention. "No duplicates" is caller-discipline, not a block property: enforced upstream by SkipMap (memtable) and later by the SST builder's one-pass write; within-block dups across levels are handled by merge iterators, not here. Verdict: WRONG first, correct after the byte-array correction.
 
 
 ## Week 1, Day 2 — Iterators
