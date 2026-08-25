@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use anyhow::Result;
 
 use super::StorageIterator;
@@ -24,7 +21,8 @@ use super::StorageIterator;
 pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
-    // Add fields as need
+    /// Whether the merged cursor currently reads from A (the newer, tie-winning side).
+    use_a: bool,
 }
 
 impl<
@@ -33,7 +31,21 @@ impl<
 > TwoMergeIterator<A, B>
 {
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        let mut iter = Self { a, b, use_a: false };
+        iter.recompute_leader();
+        Ok(iter)
+    }
+
+    /// A (newer) leads while it is valid and its key is <= B's; ties go to A. When only
+    /// one side is valid, that side leads.
+    fn recompute_leader(&mut self) {
+        self.use_a = if !self.a.is_valid() {
+            false
+        } else if !self.b.is_valid() {
+            true
+        } else {
+            self.a.key() <= self.b.key()
+        };
     }
 }
 
@@ -45,18 +57,45 @@ impl<
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if self.use_a {
+            self.a.key()
+        } else {
+            self.b.key()
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if self.use_a {
+            self.a.value()
+        } else {
+            self.b.value()
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        if self.use_a {
+            self.a.is_valid()
+        } else {
+            self.b.is_valid()
+        }
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if !self.is_valid() {
+            return Ok(());
+        }
+        if self.use_a {
+            // Tie drain: B sits on the same key A is about to emit. B must advance past
+            // its stale copy too, or it resurfaces as the merged head once A moves on.
+            let drain_b = self.b.is_valid() && self.a.key() == self.b.key();
+            self.a.next()?;
+            if drain_b {
+                self.b.next()?;
+            }
+        } else {
+            self.b.next()?;
+        }
+        self.recompute_leader();
+        Ok(())
     }
 }
