@@ -11,15 +11,76 @@
 - [x] Week 1, Day 2 — Iterators (memtable iterator, merge iterator, LSM iterator, fused iterator, engine scan) — 14/14 tests cumulative
 - [x] Week 1, Day 3 — Block (builder + encode/decode + iterator, binary-search seek) — 23/23 tests cumulative
 - [x] Week 1, Day 4 — SST (builder, meta encode, iterator, block cache) — 30/30 tests cumulative
-- [ ] Week 1, Day 5 — Read path
+- [x] Week 1, Day 5 — Read path (TwoMergeIterator, SST-integrated scan/get) — 38/38 tests cumulative
 - [ ] Week 1, Day 6 — Write path
 - [ ] Week 1, Day 7 — SST optimizations (bloom filter)
 - [ ] Week 2 — Compaction, manifest, WAL
 - [ ] Week 3 — MVCC, txn, snapshot read
 
-**Current position:** Day 4 complete. Next open question is Day 5's read path (multi-source merge across memtables + SSTs, layered iterator tree).
+**Current position:** Day 5 complete. Next is Day 6's write path (`force_flush_next_imm_memtable`).
 
 ---
+
+## Week 1, Day 5 — Read path
+
+Slices: (1) `TwoMergeIterator<A,B>` over different iterator types; (2) scan with SSTs + `end_bound` in `LsmIterator`; (3) `get` fall-through to merged SSTs with exact-match gate.
+
+### Decision ledger
+
+Decision | Student's choice | Invariant/evidence | Consequence
+---------|------------------|--------------------|------------
+TwoMergeIterator tie winner | A (starter-fixed by doc comment) | "If the two iterators have the same key, prefer A" | precedence = constructor argument order
+`next()` at equal heads | advance BOTH A and B | student derivation: advancing only the winner resurrects B's stale `b->1` past A's tombstone | duplicate never resurfaces; drain condition `a.key()==b.key()` checked BEFORE moving
+Tie check timing | pre-advance | exhausted `MemTableIterator.key()` reads `""` sentinel after `next()`; tie evidence is destroyed by the move | `b->2` cannot resurface past `b->1`
+TwoMergeIterator cursor representation | `use_a: bool`, recomputed in `recompute_leader()` after create + each `next()` | book hint "a flag can indicate which iterator currently has precedence"; simpler than a heap for two inputs | `key()`/`value()`/`is_valid()` all delegate to leader
+`end_bound` predicate | Included→`key<=end`, Excluded→`key<end`, Unbounded→true | student's `<`-for-both derivation: using `<` for both drops `c` under `Included("c")` | bound enforced in `LsmIterator::is_valid` (not `next`), so `skip_tombstones` stops at the bound naturally
+Lower bound on SSTs | per-SST seek: `Included(k)`→seek_to_key(k); `Excluded(k)`→seek_to_key(k) then ONE advance if `iter.key()==key`; `Unbounded`→seek_to_first | lower-bound seek lands on first key >= target; delegated ("answer for me"): distinguishing check reads landed KEY not value | `Excluded(b)` SST `[b->5,e->9]` skips to `e`; SST `[a,c]` lands on `c` unsnipped (loses nothing)
+SST lower-bound skip is single `next()` | one advance clears the excluded key | intra-SST keys are unique | no loop needed
+Upper bound placement | in `LsmIterator::is_valid`, not `next` | enforcing in `is_valid` makes `skip_tombstones` stop at the bound without extra logic | tombstone at bound → is_valid false, loop halts clean
+I/O off the state lock | clone `Arc<state>` once, drop read guard, build SST iterators after | book invariant 5 | no block reads while holding `state.read()`
+`get` SST fall-through | probe ALL memtables; only on full miss, `MergeIterator` over `l0_sstables` each `create_and_seek_to_key(key)` | book Task 3 "direct lookups in memtables ... followed, if necessary, by a seek over a merge iterator of the SSTs" | zero SST I/O when a memtable decides
+`get` exact-match gate | accept head only if `merge.key()==key`; invalid or `!=` → `Ok(None)` | book invariant 4; student derived via `get("bb")` landing on `c` | stray-neighbor values can't leak into `get`
+`get` head tombstone | empty value → `Ok(None)` | the merge already resolved duplicates newest-first before the head is observed | deleted keys stay dead without walking older sources
+Merge beats sequential probe for get | merge iterator, never probe-per-SST-with-mismatch-abort | adversarial B: newest SST `d->4`, oldest SST `b->1`, `get(b)` — sequential newest-mismatch→None loses `b`; merge keeps both cursors live and surfaces `b->1` | every source's cursor stays live; precedence is a tie-break not a veto
+`get` return copy | `Bytes::copy_from_slice(iter.value())` | `value()` borrows the cached block; `get` must return owned `Bytes` | one memcpy per hit
+`num_active_iterators` | NOT overridden in TwoMergeIterator | our Day-2 MergeIterator also uses default 1 and passed; no second convention | default rule returned; revisit if a later test demands it
+
+### Files changed
+- `src/iterators/two_merge_iterator.rs` — full impl (`use_a` flag + `recompute_leader`, `create`, `key`/`value`/`is_valid`/`next`); `#![allow(unused_variables)]`/`dead_code` TODOs REMOVED.
+- `src/lsm_iterator.rs` — `LsmIteratorInner` swapped to `TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>`; added `end_bound: Bound<Bytes>`; `new` takes `(iter, end_bound)`; `skip_tombstones` now drives on `self.is_valid()` (bound-aware); `is_valid` enforces Included/Excluded/Unbounded. `allow` TODOs REMOVED.
+- `src/lsm_storage.rs` — imports: `StorageIterator`, `TwoMergeIterator`, `KeySlice`, `SsTableIterator`. `scan`: clone snapshot off-lock, memtable `MergeIterator` (SkipMap::range handles native bounds), L0 SST `MergeIterator` built newest→oldest with per-SST lower-bound seek (+excluded single-advance fix-up), wrap `TwoMergeIterator(A=mem, B=sst)` → `LsmIterator::new(merge, upper.map(Bytes::copy_from_slice))` → `FusedIterator`. `get`: memtable probe unchanged (memtable tombstone → `None` immediately); on full miss, build SST merge off-lock, gate on `is_valid && key()==key`, empty value → `None`, else `Some(Bytes::copy_from_slice(value))`.
+
+### Key invariants the code relies on
+- A wins TwoMergeIterator ties; A = memtable merge, B = SST merge ⇒ memtables precede L0.
+- l0_sstables is stored newest→oldest; MergeIterator's index tie-break keeps newer SST on top when equal keys collide within L0.
+- Within one SST, keys are unique (builder one-pass from memtable) ⇒ a single `next()` clears an excluded lower-bound key.
+- MergeIterator resolves duplicates BEFORE `get` checks exact-match/tombstone at the head: the observed head is already newest-wins final.
+- Creating/seeking `SsTableIterator` clones the state snapshot first; no block reads under `state.read()`.
+- `end_bound` enforced only in `LsmIterator`, not lower; SST iterators have no end-bound seek support.
+- `LsmIterator::KeyType = &[u8]`; bound comparison uses `inner.key().raw_ref()` vs `Bytes.as_ref()`.
+
+### Boundary cases the supplied tests may not establish
+1. **Cutting a scan BEFORE the first merged key.** `test_task2_storage_scan_end_bound_at_seek_position` covers a bound that lands exactly on a seek position; we don't independently verify `scan(Excluded(k))` when `k` is the very first key produced (memtable cut already handled by SkipMap; SST cut exercised).
+2. **`get` where newest SST lacks the key but older has it** (adversarial B) — not independently supplied by the suite; sequential-probe bugs would hide.
+3. **Head-tombstone in SST (adversarial C)** — merge surfaces newest's `""`; we return `None`. A test that puts only a tombstone in the newest SST and a live value in an older one confirms the head-is-final rule.
+4. **Empty L0 (no SSTs)** — sst_iters is empty; `MergeIterator::create(vec![])` produces an invalid merge; `get` returns `None` immediately; scan degenerates to the memtable merge only. Covered implicitly by start-of-day state, not named.
+5. **Tombstone at Excluded upper bound** — `is_valid` returns false at `key==end`, so `skip_tombstones` never reads the next entry; clean termination.
+6. **`use_a` when A exhausted at birth** — `recompute_leader` handles `!a.is_valid()` → B leads; covered by task1 merge tests.
+
+### Commands run (Day 5)
+- `cargo check --lib` — clean after each slice.
+- `cargo x copy-test --week 1 --day 5` — added `mod week1_day5` (tests were already present in tree from a prior run; copy-test re-registered).
+- `cargo test week1_day5` — **8/8 pass** (test_task1_merge_1..5, task2_storage_scan, task2_storage_scan_end_bound_at_seek_position, task3_storage_get).
+- `cargo x scheck` (repo root) — fmt clean, check clean, **38/38 tests** (6 day1 + 8 day2 + 9 day3 + 7 day4 + 8 day5), clippy clean after dropping two `*key`→`key` auto-deref fixes in scan's seek call.
+
+### Review lines (Day 5)
+1. `let drain_b = self.b.is_valid() && self.a.key() == self.b.key(); self.a.next()?; if drain_b { self.b.next()?; }` (TwoMergeIterator::next) — Q(a): what does drain_b decide, A: "whether to advance B too; if same key, A covers B". Q(b): walk `A=[b->1]`, `B=[b->2,c->3]` with the check moved AFTER `a.next()`: A advances to exhausted (`""` sentinel), `""` != `"b"`, drain_b false, B NOT moved → merged stream emits `b->2` (resurrected stale duplicate). Student initially answered "emits c->3" (traced the FIXED code); corrected after the exhausted-sentinel hint. Verdict: wrong first, correct after correction.
+2. `if !self.inner.is_valid() { return false; } match &self.end_bound { Included(end) => key <= end, Excluded(end) => key < end, Unbounded => true }` (LsmIterator::is_valid) — Q: Included("c") over `{a,b,c,d}` emits? A: "[a,b,c], `c <= end`". Excluded? "[a,b]". `<` for both? "case 1 drops c". Correct first attempt.
+3. `if it.is_valid() && it.key().raw_ref() == *key { it.next()?; }` (scan, Excluded lower fix-up) — Q(a): what does `==*key` fix, why doesn't Included need it: A correct (seek lands >=search; Excluded must skip exact hit; Included wants it). Q(b): drop the check, SST `[a->1,c->6]` under `Excluded("b")`: seek lands `c->6`, ==check false BUT if dropped we'd advance anyway → lose `c`. Correct.
+4. `if !iter.is_valid() || iter.key().raw_ref() != key { return Ok(None); }` (get) — Q(a): the two absent shapes: A "≥search key" partial; corrected to (1) invalid (no key ≥k anywhere) + (2) valid but head strictly `>k`. Q(b): drop `!=key`, `get(b)` vs SST `[c->3]`: student answered the CORRECT code (`None`); the bugged code returns `Ok(Some(3))` — phantom point read, `c`'s value attributed to absent `b`. Catastrophic wrong data, not just wrong answer. Verdict: partial first, correct after the "walk the BROKEN code" nudge.
+
+### Final understanding check (Day 5)
+Predication example (book): mutable `b->""` `d->4`; imm `a->1` `b->2`; newest L0 `a->0` `c->3` `d->3`. Traces clean: `get(a)=1` (imm beats L0), `get(b)=None` (mutable tombstone wins), scan Included a..d = `a->1, c->3, d->4` (imm/memtable beat SST on ties; SST-only `c->3` surfaces). Source-of-truth for each key identified correctly.
 
 ## Week 1, Day 4 — SST
 

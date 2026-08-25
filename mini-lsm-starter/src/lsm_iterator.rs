@@ -12,26 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
+use std::ops::Bound;
 
 use anyhow::Result;
+use bytes::Bytes;
 
 use crate::{
-    iterators::{StorageIterator, merge_iterator::MergeIterator},
+    iterators::{
+        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+    },
     mem_table::MemTableIterator,
+    table::SsTableIterator,
 };
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>;
+type LsmIteratorInner =
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
+    end_bound: Bound<Bytes>,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
-        let mut iter = Self { inner: iter };
+    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
+        let mut iter = Self {
+            inner: iter,
+            end_bound,
+        };
         // The merge may surface a tombstone at its very first position, so
         // skip must happen at birth as well as on every advance.
         iter.skip_tombstones()?;
@@ -42,7 +50,7 @@ impl LsmIterator {
     /// duplicate resolution inside `LsmIteratorInner` and are only hidden here,
     /// above the merge.
     fn skip_tombstones(&mut self) -> Result<()> {
-        while self.inner.is_valid() && self.inner.value().is_empty() {
+        while self.is_valid() && self.inner.value().is_empty() {
             self.inner.next()?;
         }
         Ok(())
@@ -53,7 +61,16 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        self.inner.is_valid()
+        if !self.inner.is_valid() {
+            return false;
+        }
+        // Upper bound: Included -> key <= end; Excluded -> key < end; Unbounded -> always.
+        // Enforced here (not in next) so skip_tombstones stops at the bound naturally.
+        match &self.end_bound {
+            Bound::Included(end) => self.inner.key().raw_ref() <= end.as_ref(),
+            Bound::Excluded(end) => self.inner.key().raw_ref() < end.as_ref(),
+            Bound::Unbounded => true,
+        }
     }
 
     fn key(&self) -> &[u8] {

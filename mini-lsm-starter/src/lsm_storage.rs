@@ -30,12 +30,15 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -311,7 +314,37 @@ impl LsmStorageInner {
                 None => continue,
             }
         }
-        Ok(None)
+
+        // No memtable holds the key: fall through to L0 SSTs. The read guard was
+        // already dropped when `snapshot` was cloned, so seeking here does its I/O
+        // off-lock. l0_sstables is newest->oldest, so the merge's index tie-break
+        // keeps precedence.
+        let mut sst_iters: Vec<Box<SsTableIterator>> =
+            Vec::with_capacity(snapshot.l0_sstables.len());
+        for sst_id in snapshot.l0_sstables.iter() {
+            let sst = snapshot
+                .sstables
+                .get(sst_id)
+                .expect("l0_sstables references a missing SST")
+                .clone();
+            sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                sst,
+                KeySlice::from_slice(key),
+            )?));
+        }
+        let iter = MergeIterator::create(sst_iters);
+        // A lower-bound seek may land on the next greater key, so a value counts only
+        // on exact key equality (invariant 4). An empty value is a tombstone: the key
+        // is deleted, not "absent, keep looking" — the merge already resolved any
+        // duplicate, so the head entry is final.
+        if !iter.is_valid() || iter.key().raw_ref() != key {
+            return Ok(None);
+        }
+        let value = iter.value();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Bytes::copy_from_slice(value)))
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -385,17 +418,56 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
+        // Clone the Arc<LsmStorageState> and drop the read guard before building any
+        // SST iterator: creating/seeking an SsTableIterator may read a block from disk.
         let snapshot = self.state.read().clone();
-        // Mutable memtable first (index 0 = newest), then imm_memtables front-to-back
-        // (already newest-to-oldest) — the same precedence order as `get`.
+
+        // --- memtable merge: SkipMap::range enforces both bounds natively ---
         let mut memtable_iters: Vec<Box<MemTableIterator>> =
             Vec::with_capacity(snapshot.imm_memtables.len() + 1);
         memtable_iters.push(Box::new(snapshot.memtable.scan(lower, upper)));
         for memtable in snapshot.imm_memtables.iter() {
             memtable_iters.push(Box::new(memtable.scan(lower, upper)));
         }
-        let merge_iter = MergeIterator::create(memtable_iters);
-        let lsm_iter = LsmIterator::new(merge_iter)?;
+        let memtable_merge = MergeIterator::create(memtable_iters);
+
+        // --- L0 SST merge: l0_sstables is newest->oldest, so MergeIterator's index
+        // tie-break keeps the newer SST on top. The lower bound is applied per-SST at
+        // seek time (SsTableIterator has no end-bound seek); the upper bound is
+        // enforced later in LsmIterator. ---
+        let mut sst_iters: Vec<Box<SsTableIterator>> =
+            Vec::with_capacity(snapshot.l0_sstables.len());
+        for sst_id in snapshot.l0_sstables.iter() {
+            let sst = snapshot
+                .sstables
+                .get(sst_id)
+                .expect("l0_sstables references a missing SST")
+                .clone();
+            let iter = match &lower {
+                Bound::Included(key) => {
+                    SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))?
+                }
+                Bound::Excluded(key) => {
+                    let mut it =
+                        SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))?;
+                    // Lower-bound seek lands on `key` itself when present; the bound
+                    // excludes it, so skip that one entry. Intra-SST keys are unique,
+                    // so a single advance suffices.
+                    if it.is_valid() && it.key().raw_ref() == *key {
+                        it.next()?;
+                    }
+                    it
+                }
+                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst)?,
+            };
+            sst_iters.push(Box::new(iter));
+        }
+        let sst_merge = MergeIterator::create(sst_iters);
+
+        // A = memtable merge (newer), B = SST merge (older): TwoMergeIterator prefers
+        // A on ties, matching memtable-precedence-over-L0.
+        let two_merge = TwoMergeIterator::create(memtable_merge, sst_merge)?;
+        let lsm_iter = LsmIterator::new(two_merge, upper.map(Bytes::copy_from_slice))?;
         Ok(FusedIterator::new(lsm_iter))
     }
 }
