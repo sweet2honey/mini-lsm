@@ -161,6 +161,12 @@ impl LsmStorageInner {
     }
 
     fn trigger_flush(&self) -> Result<()> {
+        // Drain one oldest immutable memtable per wake-up; a queue that outgrows the
+        // limit stays visible as pressure rather than being hidden in a long flush.
+        let imm_memtable_count = self.state.read().imm_memtables.len();
+        if imm_memtable_count >= self.options.num_memtable_limit {
+            self.force_flush_next_imm_memtable()?;
+        }
         Ok(())
     }
 

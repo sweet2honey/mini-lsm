@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::ops::Bound;
 use std::path::Path;
@@ -141,9 +139,16 @@ impl MemTable {
         iterator
     }
 
-    /// Flush the mem-table to SSTable. Implement in week 1 day 6.
-    pub fn flush(&self, _builder: &mut SsTableBuilder) -> Result<()> {
-        unimplemented!()
+    /// Flush the mem-table to SSTable.
+    pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
+        // The SkipMap is key-ordered, so a full-range scan feeds the builder entries
+        // in exactly the ascending order SsTableBuilder::add requires.
+        let mut iter = self.scan(Bound::Unbounded, Bound::Unbounded);
+        while iter.is_valid() {
+            builder.add(iter.key(), iter.value());
+            iter.next()?;
+        }
+        Ok(())
     }
 
     pub fn id(&self) -> usize {

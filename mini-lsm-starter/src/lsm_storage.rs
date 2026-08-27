@@ -38,7 +38,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -173,7 +173,25 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        // Signal the background threads to stop, then wait for them, so no flush or
+        // compaction work races with the shutdown drain below.
+        self.compaction_notifier.send(()).ok();
+        self.flush_notifier.send(()).ok();
+        if let Some(handle) = self.compaction_thread.lock().take() {
+            handle
+                .join()
+                .map_err(|e| anyhow::anyhow!("compaction thread panicked: {e:?}"))?;
+        }
+        if let Some(handle) = self.flush_thread.lock().take() {
+            handle
+                .join()
+                .map_err(|e| anyhow::anyhow!("flush thread panicked: {e:?}"))?;
+        }
+        // Drain any immutable memtables still in memory so every frozen table reaches L0.
+        while !self.inner.state.read().imm_memtables.is_empty() {
+            self.inner.force_flush_next_imm_memtable()?;
+        }
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -260,6 +278,9 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
+        // The database directory may not exist yet; the first flush would fail to
+        // create its SST file without it.
+        std::fs::create_dir_all(path)?;
         let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -404,7 +425,51 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+
+        // Select the oldest immutable memtable (the last in the list). Selection and
+        // installation both hold state_lock, so two flushes can never choose or remove
+        // the same memtable.
+        let memtable_to_flush = {
+            let guard = self.state.read();
+            let Some(memtable) = guard.imm_memtables.last() else {
+                return Ok(());
+            };
+            memtable.clone()
+        };
+
+        // Build the SST holding no state lock at all: the source memtable is frozen,
+        // so its contents cannot change, and block encoding + file I/O is far too slow
+        // to run under a lock that readers and writers share.
+        let sst_id = memtable_to_flush.id();
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        memtable_to_flush.flush(&mut builder)?;
+        let sst = builder.build(
+            sst_id,
+            Some(self.block_cache.clone()),
+            self.path_of_sst(sst_id),
+        )?;
+
+        // Install atomically: remove exactly the memtable that was flushed and register
+        // the SST (newest side of L0) in a single snapshot swap. Readers see either the
+        // full old state or the full new state.
+        {
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
+            let removed = snapshot
+                .imm_memtables
+                .pop()
+                .expect("immutable memtable vanished between selection and install; only flushes remove it, and state_lock serializes flushes");
+            assert_eq!(
+                removed.id(),
+                sst_id,
+                "flushed SST must correspond to the popped immutable memtable"
+            );
+            snapshot.l0_sstables.insert(0, sst_id);
+            snapshot.sstables.insert(sst_id, Arc::new(sst));
+            *guard = Arc::new(snapshot);
+        }
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
