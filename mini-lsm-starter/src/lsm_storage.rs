@@ -264,6 +264,29 @@ impl MiniLsm {
     }
 }
 
+/// Whether an SST whose key range is `[first, last]` can contribute any key to a scan
+/// over (lower, upper). When unsure, keep the SST: over-keeping costs I/O, while
+/// over-skipping silently loses keys.
+fn range_overlap(lower: Bound<&[u8]>, upper: Bound<&[u8]>, first: &[u8], last: &[u8]) -> bool {
+    let above_last = match lower {
+        Bound::Included(k) => k > last,
+        Bound::Excluded(k) => k >= last,
+        Bound::Unbounded => false,
+    };
+    let below_first = match upper {
+        Bound::Included(k) => k < first,
+        Bound::Excluded(k) => k <= first,
+        Bound::Unbounded => false,
+    };
+    !above_last && !below_first
+}
+
+/// Whether `key` may exist in an SST spanning `[first, last]`: a point query is the
+/// closed-edge overlap degenerated to `first <= key <= last`.
+fn key_within(key: &[u8], first: &[u8], last: &[u8]) -> bool {
+    first <= key && key <= last
+}
+
 impl LsmStorageInner {
     pub(crate) fn next_sst_id(&self) -> usize {
         self.next_sst_id
@@ -348,6 +371,11 @@ impl LsmStorageInner {
                 .get(sst_id)
                 .expect("l0_sstables references a missing SST")
                 .clone();
+            // Optimization only: an SST whose range cannot hold `key` is skipped
+            // before spending a block read on its seek.
+            if !key_within(key, sst.first_key().raw_ref(), sst.last_key().raw_ref()) {
+                continue;
+            }
             sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
                 sst,
                 KeySlice::from_slice(key),
@@ -508,6 +536,16 @@ impl LsmStorageInner {
                 .get(sst_id)
                 .expect("l0_sstables references a missing SST")
                 .clone();
+            // Optimization only: skip SSTs whose [first,last] cannot overlap the
+            // requested range; the result stream is unchanged (book invariant 5).
+            if !range_overlap(
+                lower,
+                upper,
+                sst.first_key().raw_ref(),
+                sst.last_key().raw_ref(),
+            ) {
+                continue;
+            }
             let iter = match &lower {
                 Bound::Included(key) => {
                     SsTableIterator::create_and_seek_to_key(sst, KeySlice::from_slice(key))?

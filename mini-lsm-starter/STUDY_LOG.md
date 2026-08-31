@@ -12,12 +12,65 @@
 - [x] Week 1, Day 3 — Block (builder + encode/decode + iterator, binary-search seek) — 23/23 tests cumulative
 - [x] Week 1, Day 4 — SST (builder, meta encode, iterator, block cache) — 30/30 tests cumulative
 - [x] Week 1, Day 5 — Read path (TwoMergeIterator, SST-integrated scan/get) — 38/38 tests cumulative
-- [ ] Week 1, Day 6 — Write path
+- [x] Week 1, Day 6 — Write path (flush, trigger+close, SST range filter) — 5/5 tests, 43/43 cumulative
 - [ ] Week 1, Day 7 — SST optimizations (bloom filter)
 - [ ] Week 2 — Compaction, manifest, WAL
 - [ ] Week 3 — MVCC, txn, snapshot read
 
-**Current position:** Day 5 complete. Next is Day 6's write path (`force_flush_next_imm_memtable`).
+**Current position:** Day 6 complete. Next is Day 7's SST optimizations (bloom filter).
+
+---
+## Week 1, Day 6 — Write path
+
+Slices: (1) flush (`MemTable::flush` + `force_flush_next_imm_memtable` + `open` dir creation); (2) trigger + `MiniLsm::close`; (3) SST range filter + `num_active_iterators` up the stack.
+
+### Decision ledger
+
+Decision | Student's choice | Invariant/evidence | Consequence
+---------|------------------|--------------------|------------
+Flush selection | oldest imm = LAST of imm_memtables; student traced [7,6,5]->flush 5, leave [7,6] | FIFO (freeze order == flush order) keeps write-time order == probe order; flushing 6 or 7 first punches a hole in the precedence chain | pop from back; single well-defined pick
+New SST position | FRONT of l0_sstables: insert(0, id); student derived via get(a): [4,3]+SST5(a->9) -> [5,4,3], get(a)=a->9 | tie-break (lower index wins) implements recency across the memtable/L0 boundary too | one precedence rule spans all sources
+Flush lock shape (delegated) | whole fn under state_lock; PICK = brief state.read (clone Arc, drop); BUILD lock-free; INSTALL = state.write + pop + assert_eq!(id) + insert(0) + map insert + single Arc swap; empty queue -> Ok(()) | source imm is immutable (safe lock-free read); Day-1 rule "serialize all structural mods with state_lock"; swap makes pop+insert one visible transition | flushes serialize; readers see one complete snapshot; no disk I/O under reader-shared locks
+Flush feed order | SkipMap ascending via scan(Unbounded, Unbounded) | SkipMap key-ordered; SsTableBuilder::add requires ascending | one ordered pass, no re-sort
+trigger_flush policy | drain-ONE per wake-up (student REVISED own initial drain-all choice) | drain rate disk-bound either way; queue length = honest pressure signal; drain-all risks spin if freezes permanently outrun disk | lag visible in queue; write stalls deferred to Week-2 bonus
+SST scan exclusion (derived) | keep iff request range overlaps [first,last]; lower Included(k): skip k>last; lower Excluded(k): skip k>=last; upper Included(k): skip k<first; upper Excluded(k): skip k<=first | student answered all five cases (a-d skip, e keep); edge adjective flips <= to < | `range_overlap`; filter is pure predicate; over-keep only slow
+SST get exclusion (derived) | skip iff k < first or k > last | closed-edge overlap degenerated to a point | `key_within`; get skips impossible SSTs before any block read
+
+### Files changed
+- `src/mem_table.rs` — `flush(builder)`: full-range scan feeds builder in ascending order. Lint allows removed (compiles warning-free despite week-2/3 stubs: pub-API reachability + underscore params).
+- `src/lsm_storage.rs` — `force_flush_next_imm_memtable` (pick/build/install per ledger; expect+assert_eq on popped id), `open` + `std::fs::create_dir_all` before state creation, `MiniLsm::close` (send both notifiers, join compaction+flush handles, drain remaining imms; no sync_dir call — week 2 owns durability), `range_overlap`/`key_within` helpers, filters in `get` (line ~374) and `scan` (line ~539). Lint allows KEPT here: path_of_wal*/sync_dir/write_batch are week-2 stubs that would re-warn (deviation from initial plan, honest reason recorded).
+- `src/compact.rs` — `trigger_flush`: imm count >= num_memtable_limit -> force one flush; read guard dropped before calling (no deadlock). Allows kept (compaction stubs).
+- `src/iterators/merge_iterator.rs` — `num_active_iterators` = heap children sum + `current`; invalid-at-birth children never counted (create drops them). Lint allows removed.
+- `src/iterators/two_merge_iterator.rs` — sum of a+b (closes Day-5 note "revisit if a later test demands it" — test_task3 demanded it).
+- `src/lsm_iterator.rs` — `LsmIterator` and `FusedIterator` delegate to inner.
+
+### Key invariants the code relies on
+- Only flushes remove imm memtables; freeze only inserts; both hold state_lock -> between PICK and INSTALL the popped element is still last (assert_eq is the tripwire).
+- Single Arc swap in INSTALL: no snapshot lacks the flushed table's data, none has it twice (zero-copy vs two-copy transitions both impossible).
+- Memtable BUILD input is immutable (frozen); block encoding + file I/O run with no locks at all.
+- Excluded bounds at equality mean "bound threw the value away" (skip safe); Included arms must stay strict (>/ <) because equality = bound wants exactly the boundary key, which IS in the SST (first/last are inclusive on disk).
+- Keep/skip asymmetry: over-keep = wasted I/O (pessimization); over-skip = silent key loss. All mutation risk concentrates on Included arms.
+- `num_active_iterators` counts iterators OPENED with valid data, not sources that exist.
+
+### Boundary cases the supplied tests may not establish
+1. close() racing a mid-flight tick flush: tick arm can fire once before the notifier arm; both funnel through state_lock + empty-recheck -> harmless no-op. Concurrent path untested.
+2. Filter keep-edges (get key == last_key; scan Included(k) == last): test_task3 asserts COUNTS only; case 6's `min <= n < max` passes even with a skip-everything edge bug. Edge-key content coverage is thin — the adversarial dialogue had to supply it.
+3. num_active_iterators = sources consulted, not sources existing (empty-at-birth memtable iterator dropped by MergeIterator::create).
+4. Crash between build and install -> orphan .sst file; invisible to week-1 open (fresh state); manifest cleanup is week 2.
+5. Sustained freeze > disk -> unbounded queue growth; no write stall (drain-one rationale; Week-2 bonus).
+
+### Commands run (Day 6)
+- `cargo check --lib` — clean after one E0382 fix (create_dir_all after `let path = path.as_ref()`).
+- `cargo x copy-test --week 1 --day 6` + `cargo test week1_day6` — first run 4/5 (test_task3_sst_filter: "did you implement num_active_iterators? current active iterators = 1" — expected slice boundary); after slice 2: **5/5**.
+- `cargo fmt -p mini-lsm-starter` then `cargo x scheck` (repo root) — fmt clean, clippy clean, **43/43 tests** (6 day1 + 8 day2 + 9 day3 + 7 day4 + 8 day5 + 5 day6).
+- Final diff: 5 product files, +64/-4 (+ harness-managed tests.rs).
+
+### Review lines (Day 6)
+1. `Bound::Excluded(k) => k >= last` (range_overlap) — Q(a) why >= not >: student's skip conclusion right, justification INVERTED (claimed SST excludes last; truth: SST [first,last] is inclusive, the Excluded REQUEST excludes the boundary). Corrected with evidence (Day-4 last_key = physically stored last entry; included-arm inversion would lose key at boundary). Q(b) "mutate >= to >, construct key loss" — student traced correctly (false -> not above_last -> keep) and thereby disproved my false-premise question: that mutation is a pessimization (wasted block open), never a loss. Delegated answer: the real loss lives on the MIRROR arm — lower `Included(k) => k > last` mutated to `k >= last`; SST [a,c] + scan Included("c") skips the SST -> `c` vanishes silently (twin: upper Included `k < first` -> `k <= first`). Structural lesson: Excluded arms born aggressive (>=) are safe because the bound already discarded the boundary; Included arms must stay strict. Verdict: partial (trace correct, semantics inverted, trap unspotted), delegated after hint.
+2. Mid-BUILD freeze adversarial (predict) — student answered "freeze" for both put phases; missed the two-phase split (write via SkipMap needs no state_lock and succeeds; only the threshold-crossing freeze blocks ~BUILD-long). After walkthrough: writes never block; crossing puts queue behind INSTALL; memtable overshoots target_sst_size (soft limit tolerates); exactly one freeze follows (Day-1 recheck). Chosen trade: bounded writer-latency spike for race-freedom; readers unaffected (never take state_lock). Verdict: partial, corrected.
+
+### Final understanding check (Day 6)
+Timeline: memtable 7 holds x->1; freeze -> imm [7], mutable 8; flush mid-BUILD; scan; INSTALL; scan. Delegated. Scan A consults mutable 8 + imm 7 -> x->1 from 7 (one copy, unchanged source). Scan B consults mutable 8 + SST 7 -> x->1 from disk. Zero copies impossible (pop and insert are ONE Arc swap — no snapshot lacks 7); two copies impossible (same atomicity; and even hypothetical two-visible is read-safe: same value, memtable wins ties). Post-install scan A's stale Arc<MemTable> handle harmless (frozen bytes). Verdict: delegated; invariant on ledger.
 
 ---
 

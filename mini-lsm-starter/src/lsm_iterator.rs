@@ -85,6 +85,11 @@ impl StorageIterator for LsmIterator {
         self.inner.next()?;
         self.skip_tombstones()
     }
+
+    // Tombstone skipping and the upper bound add no iterators of their own.
+    fn num_active_iterators(&self) -> usize {
+        self.inner.num_active_iterators()
+    }
 }
 
 /// A wrapper around existing iterator, will prevent users from calling `next` when the iterator is
@@ -136,5 +141,9 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
             return Err(e);
         }
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.iter.num_active_iterators()
     }
 }

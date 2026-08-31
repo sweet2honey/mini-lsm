@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::cmp::{self};
 use std::collections::BinaryHeap;
 use std::collections::binary_heap::PeekMut;
@@ -93,6 +90,19 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         self.current
             .as_ref()
             .is_some_and(|current| current.1.is_valid())
+    }
+
+    /// Iterators opened by this merge: every child still in the heap plus the surfaced
+    /// one. Children exhausted at birth never entered; exhausted-on-advance ones left.
+    fn num_active_iterators(&self) -> usize {
+        self.iters
+            .iter()
+            .map(|wrapper| wrapper.1.num_active_iterators())
+            .sum::<usize>()
+            + match &self.current {
+                Some(current) => current.1.num_active_iterators(),
+                None => 0,
+            }
     }
 
     fn next(&mut self) -> Result<()> {
