@@ -363,6 +363,7 @@ impl LsmStorageInner {
         // already dropped when `snapshot` was cloned, so seeking here does its I/O
         // off-lock. l0_sstables is newest->oldest, so the merge's index tie-break
         // keeps precedence.
+        let key_hash = farmhash::fingerprint32(key);
         let mut sst_iters: Vec<Box<SsTableIterator>> =
             Vec::with_capacity(snapshot.l0_sstables.len());
         for sst_id in snapshot.l0_sstables.iter() {
@@ -374,6 +375,14 @@ impl LsmStorageInner {
             // Optimization only: an SST whose range cannot hold `key` is skipped
             // before spending a block read on its seek.
             if !key_within(key, sst.first_key().raw_ref(), sst.last_key().raw_ref()) {
+                continue;
+            }
+            // Bloom filter (Day 7): a definitive "absent" skips iterator creation
+            // and its block reads; "maybe" falls through to the seek, where the
+            // exact-match gate still decides. Verdict is per-file: skip = continue.
+            if let Some(bloom) = &sst.bloom
+                && !bloom.may_contain(key_hash)
+            {
                 continue;
             }
             sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(

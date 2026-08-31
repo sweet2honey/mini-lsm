@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::{BufMut, Bytes};
 
-use super::{BlockMeta, FileObject, SsTable};
+use super::{BlockMeta, FileObject, SsTable, bloom::Bloom};
 use crate::{
     block::BlockBuilder,
     key::{KeyBytes, KeySlice},
@@ -33,6 +33,8 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    /// One 32-bit hash per key added, in add order — input to the bloom filter.
+    key_hashes: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -45,6 +47,7 @@ impl SsTableBuilder {
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
+            key_hashes: Vec::new(),
         }
     }
 
@@ -74,6 +77,8 @@ impl SsTableBuilder {
             self.first_key.is_empty() || self.last_key.as_slice() <= key.raw_ref(),
             "keys must be added in sorted order"
         );
+        // Hash now so build can construct the bloom filter with no second pass.
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
         if self.builder.add(key, value) {
             if self.first_key.is_empty() {
                 self.first_key.extend_from_slice(key.raw_ref());
@@ -105,12 +110,21 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
-        let _ = &mut self;
         self.finish_block();
         let mut buf = self.data;
+        // Footer (Day 7 book layout): metadata | meta_offset | bloom | bloom_offset.
+        // Each offset is captured when buf reaches its section's start, appended
+        // after the section ends.
         let meta_offset = buf.len();
         BlockMeta::encode_block_meta(&self.meta, &mut buf);
         buf.put_u32_le(meta_offset as u32);
+        let bloom_offset = buf.len();
+        let bloom = Bloom::build_from_key_hashes(
+            &self.key_hashes,
+            Bloom::bloom_bits_per_key(self.key_hashes.len(), 0.01),
+        );
+        bloom.encode(&mut buf);
+        buf.put_u32_le(bloom_offset as u32);
         let file = FileObject::create(path.as_ref(), buf)?;
         Ok(SsTable {
             file,
@@ -119,7 +133,7 @@ impl SsTableBuilder {
             block_cache,
             first_key: self.meta.first().unwrap().first_key.clone(),
             last_key: self.meta.last().unwrap().last_key.clone(),
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
             block_meta: self.meta,
         })

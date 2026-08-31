@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 pub(crate) mod bloom;
 mod builder;
 mod iterator;
@@ -159,14 +156,26 @@ impl SsTable {
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         let len = file.size();
-        let raw_meta_offset =
+        // Footer (Day 7): the last u32 is the bloom filter offset; the meta
+        // offset is stored in the u32 immediately before the bloom bytes.
+        let raw_bloom_offset =
             file.read(len - OFFSET_ENCODED_LEN as u64, OFFSET_ENCODED_LEN as u64)?;
+        let bloom_offset = (&raw_bloom_offset[..]).get_u32_le() as usize;
+        let raw_meta_offset = file.read(
+            (bloom_offset - OFFSET_ENCODED_LEN) as u64,
+            OFFSET_ENCODED_LEN as u64,
+        )?;
         let meta_offset = (&raw_meta_offset[..]).get_u32_le() as usize;
-        let meta_len = len - OFFSET_ENCODED_LEN as u64 - meta_offset as u64;
-        let raw_meta = file.read(meta_offset as u64, meta_len)?;
+        let meta_len = bloom_offset - OFFSET_ENCODED_LEN - meta_offset;
+        let raw_meta = file.read(meta_offset as u64, meta_len as u64)?;
         let block_meta = BlockMeta::decode_block_meta(&raw_meta[..]);
         let first_key = block_meta.first().unwrap().first_key.clone();
         let last_key = block_meta.last().unwrap().last_key.clone();
+        let raw_bloom = file.read(
+            bloom_offset as u64,
+            len - OFFSET_ENCODED_LEN as u64 - bloom_offset as u64,
+        )?;
+        let bloom = Bloom::decode(&raw_bloom[..])?;
         Ok(Self {
             file,
             block_meta,
@@ -175,7 +184,7 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }
