@@ -60,9 +60,22 @@ impl BlockBuilder {
             "value length must fit a u16"
         );
 
-        // 6 = key_len(2) + value_len(2) + one offset(2); the num_of_elements
-        // field is a fixed 2 bytes and does not grow per entry.
-        let entry_size = 6 + key_len + value_len;
+        // Prefix compression (Day 7): each entry stores the length of the
+        // prefix it shares with the block's FIRST key, then only the rest.
+        // The first entry is self-contained: overlap 0, rest = the whole key.
+        let overlap = if self.is_empty() {
+            0
+        } else {
+            key.raw_ref()
+                .iter()
+                .zip(self.first_key.as_key_slice().raw_ref())
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
+        let rest_len = key_len - overlap;
+        // 8 = overlap_len(2) + rest_len(2) + value_len(2) + one offset(2); the
+        // num_of_elements field is a fixed 2 bytes and does not grow per entry.
+        let entry_size = 8 + rest_len + value_len;
         // Reject only when the block is non-empty and the projected encoded
         // size would exceed the target. The first entry is always accepted so
         // the builder makes forward progress even on an oversized key.
@@ -74,8 +87,9 @@ impl BlockBuilder {
             self.first_key = key.to_key_vec();
         }
         self.offsets.push(self.data.len() as u16);
-        self.data.put_u16_le(key_len as u16);
-        self.data.put_slice(key.raw_ref());
+        self.data.put_u16_le(overlap as u16);
+        self.data.put_u16_le(rest_len as u16);
+        self.data.put_slice(&key.raw_ref()[overlap..]);
         self.data.put_u16_le(value_len as u16);
         self.data.put_slice(value);
         true
@@ -92,6 +106,7 @@ impl BlockBuilder {
         Block {
             data: self.data,
             offsets: self.offsets,
+            first_key: self.first_key,
         }
     }
 }

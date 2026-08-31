@@ -34,12 +34,15 @@ pub struct BlockIterator {
 
 impl BlockIterator {
     fn new(block: Arc<Block>) -> Self {
+        // The block owns the first key (Day 7); every entry decodes relative
+        // to it, so the iterator must hold a copy before ANY probe order.
+        let first_key = block.first_key.clone();
         Self {
             block,
             key: KeyVec::new(),
             value_range: (0, 0),
             idx: 0,
-            first_key: KeyVec::new(),
+            first_key,
         }
     }
 
@@ -118,15 +121,18 @@ impl BlockIterator {
         }
         let data = &self.block.data[..];
         // Cursor is an absolute position into the block's data section.
+        // Day-7 record: overlap_len u16 | rest_len u16 | rest | value_len u16 | value.
         let mut cursor = self.block.offsets[index] as usize;
-        let key_len = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
+        let overlap_len = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
         cursor += 2;
-        let key = KeySlice::from_slice(&data[cursor..cursor + key_len]);
-        if index == 0 {
-            self.first_key = key.to_key_vec();
-        }
-        self.key.set_from_slice(key);
-        cursor += key_len;
+        let rest_len = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
+        cursor += 2;
+        // Full key = first_key's overlap prefix ++ stored rest bytes.
+        self.key.clear();
+        self.key
+            .append(&self.first_key.as_key_slice().raw_ref()[..overlap_len]);
+        self.key.append(&data[cursor..cursor + rest_len]);
+        cursor += rest_len;
         let value_len = u16::from_le_bytes([data[cursor], data[cursor + 1]]) as usize;
         cursor += 2;
         self.value_range = (cursor, cursor + value_len);

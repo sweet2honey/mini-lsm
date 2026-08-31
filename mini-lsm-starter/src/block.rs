@@ -15,6 +15,7 @@
 mod builder;
 mod iterator;
 
+use crate::key::KeyVec;
 pub use builder::BlockBuilder;
 use bytes::{Buf, BufMut, Bytes};
 pub use iterator::BlockIterator;
@@ -23,6 +24,9 @@ pub use iterator::BlockIterator;
 pub struct Block {
     pub(crate) data: Vec<u8>,
     pub(crate) offsets: Vec<u16>,
+    /// The block's first key (Day 7): every entry stores its key relative to
+    /// this one, so it must be in memory to decode any entry.
+    pub(crate) first_key: KeyVec,
 }
 
 impl Block {
@@ -58,9 +62,17 @@ impl Block {
 
         // Everything before the offset section is the data section.
         let data_section = &data[..offsets_start];
+        // Entry 0's record (overlap 0 by the anchor rule) restates the full
+        // first key — recover it without a separate on-disk field.
+        let entry0 = offsets[0] as usize;
+        let rest_len =
+            u16::from_le_bytes([data_section[entry0 + 2], data_section[entry0 + 3]]) as usize;
+        let mut first_key = KeyVec::new();
+        first_key.append(&data_section[entry0 + 4..entry0 + 4 + rest_len]);
         Self {
             data: data_section.to_vec(),
             offsets,
+            first_key,
         }
     }
 }

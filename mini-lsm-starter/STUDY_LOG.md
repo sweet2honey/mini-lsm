@@ -13,13 +13,84 @@
 - [x] Week 1, Day 4 — SST (builder, meta encode, iterator, block cache) — 30/30 tests cumulative
 - [x] Week 1, Day 5 — Read path (TwoMergeIterator, SST-integrated scan/get) — 38/38 tests cumulative
 - [x] Week 1, Day 6 — Write path (flush, trigger+close, SST range filter) — 5/5 tests, 43/43 cumulative
-- [ ] Week 1, Day 7 — SST optimizations (bloom filter)
+- [x] Week 1, Day 7 — SST optimizations (bloom filter, key-prefix encoding) — 3/3 tests, 46/46 cumulative
 - [ ] Week 2 — Compaction, manifest, WAL
 - [ ] Week 3 — MVCC, txn, snapshot read
 
-**Current position:** Day 6 complete. Next is Day 7's SST optimizations (bloom filter).
+**Current position:** Week 1 complete (46/46). Next is Week 2 (compaction, manifest, WAL); the student picks the day/checkpoint.
 
 ---
+
+## Week 1, Day 7 — SST optimizations
+
+Slices: (1) Bloom filter core (`bloom.rs` build/probe); (2) SST footer layout + `get` wiring; (3) block key-prefix encoding.
+
+### Decision ledger
+
+Decision | Student's choice | Invariant/evidence | Consequence
+---------|------------------|--------------------|------------
+Bloom error direction | negatives definitive, positives allowed wrong | ant example: false negative = engine silently resurrects older value / loses live key; false positive = one wasted seek, Day-5 exact-match gate still decides | NO false negatives is the filter's contract; FPR budgeted at 0.01 via bloom_bits_per_key
+False-positive mechanism | bit smearing: union of other keys' bits covers probe's k positions (fox {3,11} covered by cat{3,11}∪dog{3,7}) | bit array keeps no per-key accounting; false negatives impossible because same key→same hash→same positions, build set them all | build/probe MUST step identical sequences (book invariant 2); may_contain checks ALL k bits, early exit only on a CLEAR bit
+k positions from one hash | walk: delta = h.rotate_left(15), pos_i = (h + i·delta) mod nbits | slicing 32 bits into chunks names ≤32 positions in a 1M-bit filter; delta=0 collapses a key to 1 effective bit | one farmhash per key total; positions never stored, always recomputed
+Footer layout (course rule) | ... | metadata | meta_offset u32 | bloom | bloom_offset u32 (last) | 120-byte example; byte-count check (112≠120) exposed both missing u32 appends | open: last u32 = bloom_offset; meta_offset read at bloom_offset−4; meta = [meta_offset, bloom_offset−4), bloom = [bloom_offset, len−4); capture each offset when buffer reaches its section start, append after the section
+Bloom skip semantics | `continue` per SST, NEVER `return None` | per-file verdicts are exact; promoting one file's "definitely not" to engine-level None manufactures a false negative even though every filter was correct (ant/SST-9/SST-4 example) | skip saves iterator creation + block reads; "maybe" = unchanged Day-5 seek path
+Predicate order in get | (A) range check first, bloom second | 2 byte-compares on resident keys vs hash + k probes; both orders correct | key_hash = farmhash::fingerprint32(key) computed ONCE per get, reused across SSTs
+Overlap reference (course rule) | block's FIRST key; entry 0 self-contained (overlap 0) | previous-key scheme: entry 199 needs 199 chained decodes; binary search degrades to O(n log n); nonzero overlap at entry 0 references bytes that exist nowhere | Day-3 random-access lower-bound seek survives compression
+first_key vending | (A) Block owns first_key: builder fills at build(), Block::decode reconstructs from entry 0's record at offsets[0], iterator clones in new() | starter's cache-at-index==0 fails: binary search that never probes 0 leaves empty prefix → OOB slice panic (and overlap-0 entries silently mask it) | seek_to always has a valid prefix, any probe order; index==0 clause deleted
+Entry record format (course rule) | overlap_len(u16) \| rest_len(u16) \| rest \| value_len(u16) \| value | book-pinned; block footer (offsets+count) and BlockMeta (full first/last keys) unchanged | per-entry overhead 6→8 bytes scalar, key bytes shrink by overlap
+Size gate formula | 8 + rest_len + value_len | gate budgets bytes actually written; rest only is written (prefix never re-stored) | stale formula errs by overlap−2: >2 → early cuts, <2 → ≤2B overshoot; soft only, decode never consumes size estimates
+
+### Files changed
+- `src/table/bloom.rs` — `build_from_key_hashes`: per-hash delta-walk setting k bits; `may_contain`: identical walk, first clear bit → false, k rounds survived → true. k>30 starter escape untouched.
+- `src/table/builder.rs` — `key_hashes: Vec<u32>` collected per `add` (farmhash::fingerprint32 of raw key bytes); `build` tail: capture meta_offset → append metas → append meta_offset u32 LE → capture bloom_offset → Bloom::build_from_key_hashes(hashes, bloom_bits_per_key(len, 0.01)) → encode → append bloom_offset u32 LE; SsTable gets `bloom: Some(bloom)`.
+- `src/table.rs` — module-level `#![allow]`s REMOVED (compiles warning-free); `open` implements the new footer (bloom last) and decodes bloom via `Bloom::decode`; `create_meta_only` keeps `bloom: None`.
+- `src/lsm_storage.rs` — `get`: `key_hash` computed once before the L0 loop; after `key_within` passes, `if let Some(bloom) = &sst.bloom && !bloom.may_contain(key_hash) { continue; }` (let-chain after a clippy collapsible_if fix).
+- `src/block/builder.rs` — overlap computed vs `first_key` (zip+take_while, no alloc); new record format; entry 0 overlap 0 / full rest; size gate 6+key+value → 8+rest+value.
+- `src/block.rs` — `Block` gains `first_key: KeyVec`; `decode` reconstructs it from entry 0's self-contained record; `encode` untouched (first key lives inside the data section — no new on-disk field).
+- `src/block/iterator.rs` — `new` clones `block.first_key`; `seek_to` reconstructs key = first_key[..overlap] ++ rest into the existing KeyVec cursor; index==0 cache clause deleted; binary search / next / is_valid logic untouched.
+- Harness-managed: `src/tests.rs` + `src/tests/week1_day7.rs` via `cargo x copy-test` only.
+
+### Key invariants the code relies on
+- Builder hashes the raw user key bytes — byte-identical to what `get` hashes (book invariant 2); compression is invisible above the block layer.
+- Build and probe walk the identical position sequence; a probe checks ALL k bits and may exit early ONLY on a clear bit.
+- Footer is self-describing and byte-exact: off-by-4 in bloom_offset poisons BOTH sections (garbage meta + 4-byte bit shift → false negatives through no fault of the filter's logic). Framing correctness is part of the no-false-negatives invariant.
+- Bloom skip is scoped per file (`continue`); engine-level absence is decided only by the merge + exact-match gate.
+- Every block entry decodes from (entry 0 + its own record) only; entry 0 is the self-contained anchor. Comparators and all upper layers see FULL reconstructed keys; sort order is defined on full keys, so lower-bound binary search stays valid.
+- Tombstones are value-shaped, not key-shaped: prefix encoding touches key bytes only; `value_len = 0` reconstructs `value() == b""` with the iterator staying valid (Day-3 rule) — scans still skip tombstones at LsmIterator.
+- Week-2 meta-only SSTs carry `bloom: None` → treated as "maybe" (never skipped on missing-filter).
+
+### Boundary cases the supplied tests may not establish
+1. **Deterministic false positive** — no test forces a key that hashes onto other keys' bits; the "maybe → wasted seek → exact-gate None" path ran only probabilistically.
+2. **`bloom: None` branch** (create_meta_only) — exercised only by week-2 compaction tests; get treats None as "maybe".
+3. **Zero-overlap mid-block entries** (key sharing nothing with first key: overlap 0, rest = whole key) — generator keys all share a prefix; variable-overlap reconstruction within one block is thin.
+4. **Backward iterator** (book question) — forward-only engine, but F-scheme supports it: every entry decodes independently of neighbors.
+5. **Block-boundary prefix reset** — block N+1's first key restarts compression inside ITS block; `advance_if_needed` hops to an iterator holding block N+1's own first_key. Implicit in task3's multi-block test; not named.
+6. **Tiny SST filters** — 1-key SST → nbits floor 64, k from clamp(1,30); untested at extremes.
+
+### Commands run (Day 7)
+- `cargo check --lib` / `--all-targets` — clean after: (a) missing `super::bloom::Bloom` import in builder.rs; (b) one brace repair from an edit-range slip in iterator.rs; (c) module-`#![allow]` removal in table.rs produced zero warnings.
+- `cargo x copy-test --week 1 --day 7` — added `mod week1_day7` (+ src/tests/week1_day7.rs).
+- `cargo test -p mini-lsm-starter week1_day7` — **3/3 FIRST RUN** (test_task1_bloom_filter, test_task2_sst_decode, test_task3_block_key_compression). (Note: `cargo test week1_day7` from repo root matches nothing; `-p mini-lsm-starter` required.)
+- `cargo x scheck` (repo root) — fmt clean, clippy clean after one collapsible_if fix (bloom gate → `if let ... && ...` let-chain), **46/46 tests** (6+8+9+7+8+5+3).
+- Files: 7 product files changed (+ harness-managed tests.rs / week1_day7.rs). Student committed slice 1 (d56d81a) and slice 2 (1d084f0); slice-3 files staged by student; no agent commits.
+
+### Review lines (Day 7)
+1. `if !self.filter.get_bit(bit_pos) { return false; }` (may_contain) — Q: what one clear bit proves; why early exit legal. A: clear bit = key never set it = not inserted (bits only ever set); one counterexample suffices → correct. Flip mutation: probe dies round 0 for present keys → universal false negatives + absent keys burn k rounds saying "maybe" (filter inverts). Verdict: correct.
+2. `let bloom_offset = buf.len();` (build) — Q(a) capture window: after meta_offset append, before bloom encode (buffer len = section start only there) — correct on the backward half, forward half supplied. Q(b) capture one line early (→80 with real bloom at 84): first answer "it read meta_offset" WRONG — evidence: in the real file 80..84 HOLDS meta_offset; buggy footer makes open read 76..80 = tail of the metadata section, plus the bloom slice starts 4 bytes early and absorbs the meta_offset u32 → shifted bit array. Student then answered the follow-up: "stored key may be reported as not exist" (false negatives via framing, not filter logic). Verdict: partial → corrected with evidence.
+3. `let entry_size = 8 + rest_len + value_len;` (builder) — Q(a): direction right ("entry reuses first key's bytes"); restated: gate budgets bytes actually written, and a record only writes rest bytes. Q(b) stale `6 + key_len + value_len` formula: incomplete → delegated: error = overlap−2 (overlap>2 → early cuts/smaller blocks; overlap<2 → ≤2B overshoot); never a correctness bug because the gate is soft and `Block::decode` consumes no size estimate.
+
+### Adversarial cases (Day 7)
+A. Bloom × compression interaction: get("applepie") vs compressed SST — hash input = FULL user key (farmhash in both builder and get); block comparator sees FULL reconstructed keys, never rest bytes (rests are variable-length suffixes; ordering is defined on full keys). Layers never see each other's representation; every boundary restores full keys upward. Verdict: correct (sharpened comparator point).
+B. Tombstones through compression: [apple->"", applepie->"", applepiano->"v"] — student layout for entry 1 `5|3|pie|0|` correct; supplied: value_range empty → value()==b"", iterator stays valid (Day-3 rule), scan emits only applepiano->v after LsmIterator filters both tombstones. Verdict: partial (layout), emission supplied.
+
+### Final understanding check (Day 7)
+"Can bloom filters help scans?" — student: `show answer` (delegated). Delegated: no — a range contains infinitely many byte strings; no finite probe set proves "no key in range"; bloom answers single-string membership only. Ranges need a range-shaped index: Day-6's exact [first_key, last_key] overlap check (sortedness lets two keys summarize the file). Hence bloom gates get only; scan keeps range_overlap alone. (Production: prefix-bloom exists for fixed-prefix seeks; a general range can't reduce to one string.) Verdict: delegated.
+
+### Next unresolved
+- Week 2 (compaction/manifest/WAL) will exercise the `bloom: None` meta-only path and re-open SSTs from disk per manifest — the footer decode gets its second consumer there.
+
+---
+
 ## Week 1, Day 6 — Write path
 
 Slices: (1) flush (`MemTable::flush` + `force_flush_next_imm_memtable` + `open` dir creation); (2) trigger + `MiniLsm::close`; (3) SST range filter + `num_active_iterators` up the stack.
