@@ -14,10 +14,55 @@
 - [x] Week 1, Day 5 — Read path (TwoMergeIterator, SST-integrated scan/get) — 38/38 tests cumulative
 - [x] Week 1, Day 6 — Write path (flush, trigger+close, SST range filter) — 5/5 tests, 43/43 cumulative
 - [x] Week 1, Day 7 — SST optimizations (bloom filter, key-prefix encoding) — 3/3 tests, 46/46 cumulative
-- [ ] Week 2 — Compaction, manifest, WAL
-- [ ] Week 3 — MVCC, txn, snapshot read
+- [x] Week 2, Day 1 — Full compaction + SstConcatIterator + L1 read path — 4/4 tests, 50/50 cumulative
 
-**Current position:** Week 1 complete (46/46). Next is Week 2 (compaction, manifest, WAL); the student picks the day/checkpoint.
+**Current position:** Week 2 Day 1 complete (50/50). Next: Week 2 Day 2 (simple leveled compaction) or Day 5/6 (manifest/WAL); student picks.
+
+## Week 2, Day 1 — Compaction + concat iterator
+
+Task 1 (`compact` + `force_full_compaction`) had an independent first pass at commit 082c83a; this session revealed tests (2/2 first run) and implemented Tasks 2–3.
+
+### Decision ledger
+
+Decision | Student's choice | Invariant/evidence | Consequence
+---------|------------------|--------------------|------------
+L1 iterator shape | (A) SstConcatIterator over L1; scan = TwoMerge(mem_merge, TwoMerge(L0_merge, L1_concat)) | book: "A sorted run does not need a merge iterator"; only ONE live child, seek binary-searches which SST before any block read | precondition (sorted + non-overlapping) must hold or keys silently skip/resurrect
+Concat seek landing | last SST with first_key <= key (partition_point, saturating_sub); if in-SST seek lands invalid, hop to next SST's FIRST entry, single hop, no loop | Day-4 find_block_idx proof one level up; SSTs non-empty; next SST's first_key > key by non-overlap | seek("p") vs [a,m],[n,x],[y,z] -> opens [n,x]; student derived both halves
+Hop landing rule | seek_to_first, NEVER reuse of the create-time search key | landing rule self-contained (trivially correct); reusing search key is correct ONLY via the non-overlap precondition (borrowed correctness) and would need a dead search_key field to live forever | mirrors Day-4 advance_if_needed; zero extra state
+Duplicate semantics if precondition violated | student predicted "outputs deleted + old"; actual: skip_tombstones advances past k->"" onto k->old, DELETED KEY RESURRECTS | tombstones hidden only at engine wrapper (Day 2); concat has no heap to resolve duplicates | precondition break = silent data corruption, not a crash; hence caller discipline
+L1 in get | (A) append L1 ids to the existing key_within+bloom loop, L0 ids first then L1 | non-overlap => at most ONE L1 SST passes the range filter; exact-match gate unchanged; L0-before-L1 ordering keeps tie-break toward newer | zero new logic in get; SstConcatIterator (student's first instinct) rejected: single-key point read doesn't amortize run construction
+Precondition enforcement point | by construction in compaction (single ascending merge + monotonic target_sst_size splits; install swaps the whole run), never runtime-checked in seek | builder add requires ascending; split points monotonic | comment-only discipline in concat_iterator
+num_active_iterators | inherited default 1, no override | book: "it should always report one active iterator"; TwoMergeIterator precedent (Day 5 default kept) | none
+
+### Files changed
+- `src/iterators/concat_iterator.rs` — full impl. `create_and_seek_to_first`: empty run allowed (never-valid iterator), else open SST 0. `create_and_seek_to_key`: empty-run early return; partition_point over first_key; invalid landing -> next_sst_idx+1 then skip_to_sst. Private `skip_to_sst(idx)`: seek_to_first or current=None past the end; `is_valid` = `current.is_some_and(valid)`. Both `#![allow]` module lints removed.
+- `src/lsm_iterator.rs` — `LsmIteratorInner` = `TwoMergeIterator<MergeIterator<MemTableIterator>, TwoMergeIterator<MergeIterator<SsTableIterator>, SstConcatIterator>>`.
+- `src/lsm_storage.rs` — `scan`: L1 ids resolved to Arcs, `SstConcatIterator::create_and_seek_to_key` (Included/Excluded share one seek + single-advance fix-up on exact Excluded hit, mirroring the L0 loop) or `create_and_seek_to_first` (Unbounded); nested TwoMergeIterator. `get`: L1 loop appended after the L0 loop (same key_within + bloom filters, L0 ids first).
+
+### Key invariants the code relies on
+- Run members are sorted by first key and pairwise non-overlapping — guaranteed at compaction time, never checked at seek time.
+- At most one L1 SST can hold any given key (non-overlap).
+- MergeIterator tie-break order (memtables > L0 > L1 by construction order) must never place a stale source before a newer one.
+- Exhaustion hop lands on next SST's first entry unconditionally: previous SST's last key < next SST's first key.
+
+### Boundary cases the supplied tests may not establish
+1. **Empty-run construction** (L1 = [] before any compaction) — NOT covered by week2 tests; found via week1_day2 test_task4_integration panic (`iter.sstables[idx]` OOB on empty vec). Both constructors now handle empty; the regression is real coverage the suite DID supply indirectly.
+2. Seek key smaller than all first_keys -> partition_point 0 -> SST 0 (correct lower bound), exercised only implicitly.
+3. Seek key larger than every key -> all-invalid -> next_sst_idx = len, never-valid.
+4. Concurrent flush during force_full_compaction install (task snapshot retention) — Task 1 handles by id-list removal, but no test flushes mid-compaction.
+
+### Commands run (Day 1)
+- `cargo x copy-test --week 2 --day 1` + `cargo test -p mini-lsm-starter week2_day1` — after Task-1-only: 2 pass / 2 fail (expected slice boundary); after Tasks 2–3: **4/4** (task1, task1_all_tombstones, task2, task3).
+- `cargo x scheck` — first run FAILED at week1_day2 test_task4_integration (empty-L1 panic, concat_iterator.rs:62). Fix: empty-run guards. Re-run: **50/50**, fmt clean, clippy clean.
+
+### Review lines (Day 1)
+1. `let sst = iter.sstables[idx].clone();` (create_and_seek_to_key) — Q: what data breaks it? A (student, via failure): empty L1 -> index OOB. Verdict: found by test failure, diagnosis confirmed by agent walkthrough, student authorized fix.
+
+### Final understanding check (Day 1) — PENDING
+"Why can't concat iterators replace MergeIterator for L0?" — student has not yet attempted.
+
+### Next unresolved
+- Day 2 (simple leveled) reuses `apply_compaction_result` via CompactionController; Day 5 manifest re-opens install ordering.
 
 ---
 

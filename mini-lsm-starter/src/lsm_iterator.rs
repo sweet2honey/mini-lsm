@@ -19,15 +19,21 @@ use bytes::Bytes;
 
 use crate::{
     iterators::{
-        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+        StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
+        two_merge_iterator::TwoMergeIterator,
     },
     mem_table::MemTableIterator,
     table::SsTableIterator,
 };
 
-/// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-type LsmIteratorInner =
-    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
+/// Represents the internal type for an LSM iterator. This type will be changed
+/// across the course. Memtable merge (newest) -> L0 merge (overlapping) -> L1
+/// concat (sorted run). Outer TwoMergeIterator prefers A on ties: memtables
+/// beat SSTs; inner one: L0 beats L1.
+type LsmIteratorInner = TwoMergeIterator<
+    MergeIterator<MemTableIterator>,
+    TwoMergeIterator<MergeIterator<SsTableIterator>, SstConcatIterator>,
+>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
