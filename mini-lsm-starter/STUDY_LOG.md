@@ -16,7 +16,45 @@
 - [x] Week 1, Day 7 — SST optimizations (bloom filter, key-prefix encoding) — 3/3 tests, 46/46 cumulative
 - [x] Week 2, Day 1 — Full compaction + SstConcatIterator + L1 read path — 4/4 tests, 50/50 cumulative
 
-**Current position:** Week 2 Day 1 complete (50/50). Next: Week 2 Day 2 (simple leveled compaction) or Day 5/6 (manifest/WAL); student picks.
+## Week 2, Day 2 — Simple leveled compaction (Tasks 1+2)
+
+Slices: (1) controller (`generate_compaction_task` + `apply_compaction_result`); (2) simulator verification. Task 3 (read path) NOT yet done — LsmIteratorInner still L1-only.
+
+### Decision ledger
+
+Decision | Student's choice | Invariant/evidence | Consequence
+---------|------------------|--------------------|------------
+Ratio 公式方向 | 学生初答记反(选中健康的 L2/L3) | 正确: (len(lower)/len(upper))*100 < size_ratio_percent,下层相对上层"太瘦"才触发;L1/L2=150 违反,L3/L2≈266 健康 | 方向反 ⇒ 该合的不合、健康层白合;书 201 行思考题原题
+多条件同时违反 | 选项 A: L0 绝对优先,否则自顶向下第一个违反者,一轮一任务 | 数据自上而下流;先通上游,下游合并才能批量吸收;模拟器反复调直至 None 保证收敛 | generate_compaction_task: if L0 -> else scan -> None
+apply 的并发安全 | 学生: 只删捕获 id,不整表替换 L0 | compaction 期间 flush 可插入新 L0;整表替换会抹掉新 SST = 数据丢失(内存已无对应 memtable) | L0 用 retain;lower 整层替换安全(simple leveled 输入=整层,只有 compaction 写 levels)
+Sanity check 的定位 | 学生追问"多 compaction 线程?" | 课程 single-flight 是结构保证(单线程),非代码检查;多线程坏在版本仲裁失效(旧输出覆盖新输出),不能靠检查补救 | assert = 防自己写错(捕获 id 必须存在、upper 层必须恰为捕获集),非防并发
+墓碑处理 | (Task 1+2 范围外) | is_lower_level_bottom_level 字段已存,丢弃逻辑留给 merge 侧(Task 3 slice) | 模拟器只动 id,不触及墓碑
+
+### Files changed
+- `src/compact/simple_leveled.rs` — `generate_compaction_task`: L0 trigger (>= level0_file_num_compaction_trigger) -> L0->L1; else top-down scan for first pair with `lower_len * 100 < upper_len * size_ratio_percent` (整数乘法避免除法截断); else None. `is_lower_level_bottom_level` = (lower == max_levels). `apply_compaction_result`: L0 分支 assert captured ids present + retain by id + lower 整层替换; Some(upper) 分支 assert_eq!(upper level == captured) + **upper 清空 + lower 替换**(首个版本漏了 upper 清空,模拟器 dump 时 file_list KeyError 暴露); obsolete = upper + lower 输入(不含 output)。
+
+### Key invariants the code relies on
+- 只有一个 compaction 线程(single-flight);flush 只增 L0;只有 compaction 写 levels >= 1。
+- 任务捕获的 id 列表是唯一有权删除的集合;retain 语义天然放过新 flush。
+- simple leveled 的输入恒为整层 → upper 层应用后必为空,lower 层可安全整表替换。
+- 一轮一任务 + 自顶向下第一个违反者 ⇒ 模拟器的 while-let 收敛(书 132 行,模拟器 panic 上限 max_levels*2)。
+
+### Boundary cases the supplied tests may not establish
+1. 本章无 fine-grained 单元测试(书 140 行明说);正确性靠模拟器对比 reference。
+2. size_ratio 边界:恰好等于阈值(>=)不触发,用整数乘法 `lower*100 < upper*ratio` 与书示例 (4/2)*100=200 >= 200 不合并 一致。
+3. max_levels=1 时 L0 任务的 is_lower_level_bottom_level=true(未在模拟器中覆盖,默认 max_levels=3)。
+
+### Commands run (Day 2, Tasks 1+2)
+- `cargo run --bin compaction-simulator -- simple --iterations 20` — 首跑 panic(dump 时 file_list no entry):apply 漏清 upper 层,旧 id 留在 state 而 file_list 已删。修复后 20 轮收敛。
+- 对比 reference(50 轮,`-p mini-lsm --bin compaction-simulator-ref`):**SAME TASK COUNT,最终统计逐字节一致**(Write Amp 5.1x / Space 1.6x / Read Amp 2x);diff 仅 reference 多打的每任务原因行(可选输出)。
+- `cargo x scheck` — 50/50, fmt/clippy 干净。
+
+### Next unresolved
+- Task 3: LsmIteratorInner 扩到多层 concat + get/scan 遍历所有 level + compact 泛化(真实 SST 合并 + 墓碑按 compact_to_bottom_level 丢弃)。
+
+**Current position:** Day 2 Tasks 1+2 done (50/50, simulator matches reference). Next: Day 2 Task 3 (read path multi-level), then commit.
+
+---
 
 ## Week 2, Day 1 — Compaction + concat iterator
 
