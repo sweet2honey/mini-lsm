@@ -31,11 +31,28 @@ pub struct SstConcatIterator {
 }
 
 impl SstConcatIterator {
+    /// Debug-build guard for the caller-discipline precondition: runs must be
+    /// sorted by first key and pairwise non-overlapping. A violation here does
+    /// not panic in release builds — it silently skips or resurrects keys.
+    fn debug_assert_disjoint(sstables: &[Arc<SsTable>]) {
+        for pair in sstables.windows(2) {
+            debug_assert!(
+                pair[0].last_key().raw_ref() < pair[1].first_key().raw_ref(),
+                "SstConcatIterator requires non-overlapping, first-key-sorted SSTs: [{}..{}] overlaps [{}..{}]",
+                String::from_utf8_lossy(pair[0].first_key().raw_ref()),
+                String::from_utf8_lossy(pair[0].last_key().raw_ref()),
+                String::from_utf8_lossy(pair[1].first_key().raw_ref()),
+                String::from_utf8_lossy(pair[1].last_key().raw_ref()),
+            );
+        }
+    }
+
     /// Precondition (caller discipline, enforced by construction in compaction):
     /// `sstables` are sorted by first key and their key ranges do not overlap.
     /// The seek performs NO overlap validation; using this iterator on an
     /// overlapping run silently skips or resurrects keys.
     pub fn create_and_seek_to_first(sstables: Vec<Arc<SsTable>>) -> Result<Self> {
+        Self::debug_assert_disjoint(&sstables);
         let mut iter = Self {
             current: None,
             next_sst_idx: 0,
@@ -55,6 +72,7 @@ impl SstConcatIterator {
     /// next SST's first_key is > `key` (non-overlap invariant), so its FIRST
     /// entry is exactly the run's lower bound — a single hop suffices, no loop.
     pub fn create_and_seek_to_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
+        Self::debug_assert_disjoint(&sstables);
         if sstables.is_empty() {
             return Ok(Self {
                 current: None,
